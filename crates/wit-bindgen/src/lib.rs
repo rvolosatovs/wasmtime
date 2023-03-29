@@ -960,7 +960,7 @@ impl<'a> InterfaceGenerator<'a> {
         }
         // Generate the `pub trait` which represents the host functionality for
         // this import.
-        uwriteln!(self.src, "pub trait Host: Sized {{");
+        uwriteln!(self.src, "pub trait Host: ?Sized {{");
         for (_, func) in iface.functions.iter() {
             self.generate_function_trait_sig(owner, func);
         }
