@@ -1,6 +1,6 @@
-// only used as part of `test-programs`
-world test-reactor {
+package test-programs:test-reactor
 
+world test-reactor {
   import wasi:cli-base/environment
   import wasi:io/streams
   import wasi:cli-base/preopens

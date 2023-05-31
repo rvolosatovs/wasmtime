@@ -1,4 +1,4 @@
-wit_bindgen::generate!("test-reactor" in "../../wasi/wit");
+wit_bindgen::generate!("test-reactor");
 
 export_test_reactor!(T);
 

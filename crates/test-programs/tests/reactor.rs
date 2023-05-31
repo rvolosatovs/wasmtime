@@ -24,7 +24,7 @@ lazy_static::lazy_static! {
 include!(concat!(env!("OUT_DIR"), "/reactor_tests_components.rs"));
 
 wasmtime::component::bindgen!({
-    path: "../wasi/wit",
+    path: "reactor-tests/wit",
     world: "test-reactor",
     async: true,
     with: {
