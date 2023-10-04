@@ -77,6 +77,16 @@ async fn tcp_v6() {
 }
 
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn udp_v4() {
+    run("udp_v4").await.unwrap();
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn udp_v6() {
+    run("udp_v6").await.unwrap();
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
 async fn ip_name_lookup() {
     run("ip_name_lookup").await.unwrap();
 }

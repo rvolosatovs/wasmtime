@@ -1,14 +1,14 @@
-//! Like tcp_v4.rs, but with IPv6.
+//! Like udp_v4.rs, but with IPv6.
 
 use wasi::io::poll;
 use wasi::sockets::network::{IpAddressFamily, IpSocketAddress, Ipv6SocketAddress};
-use wasi::sockets::{instance_network, tcp_create_socket};
+use wasi::sockets::{instance_network, udp_create_socket};
 use wasi_sockets_tests::*;
 
 fn main() {
     let net = instance_network::instance_network();
 
-    let sock = tcp_create_socket::create_tcp_socket(IpAddressFamily::Ipv6).unwrap();
+    let sock = udp_create_socket::create_udp_socket(IpAddressFamily::Ipv6).unwrap();
 
     let addr = IpSocketAddress::Ipv6(Ipv6SocketAddress {
         port: 0,                           // use any free port
@@ -26,5 +26,5 @@ fn main() {
 
     sock.finish_bind().unwrap();
 
-    example_body_tcp(net, sock, IpAddressFamily::Ipv6)
+    example_body_udp(net, sock, IpAddressFamily::Ipv6)
 }

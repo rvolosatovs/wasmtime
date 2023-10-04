@@ -1,14 +1,14 @@
-//! A simple TCP testcase, using IPv4.
+//! A simple UDP testcase, using IPv4.
 
 use wasi::io::poll;
 use wasi::sockets::network::{IpAddressFamily, IpSocketAddress, Ipv4SocketAddress};
-use wasi::sockets::{instance_network, tcp_create_socket};
+use wasi::sockets::{instance_network, udp_create_socket};
 use wasi_sockets_tests::*;
 
 fn main() {
     let net = instance_network::instance_network();
 
-    let sock = tcp_create_socket::create_tcp_socket(IpAddressFamily::Ipv4).unwrap();
+    let sock = udp_create_socket::create_udp_socket(IpAddressFamily::Ipv4).unwrap();
 
     let addr = IpSocketAddress::Ipv4(Ipv4SocketAddress {
         port: 0,                 // use any free port
@@ -24,5 +24,5 @@ fn main() {
 
     sock.finish_bind().unwrap();
 
-    example_body_tcp(net, sock, IpAddressFamily::Ipv4)
+    example_body_udp(net, sock, IpAddressFamily::Ipv4)
 }
