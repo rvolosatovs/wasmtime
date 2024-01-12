@@ -611,6 +611,15 @@ impl ResourceAny {
         self.ty
     }
 
+    /// Borrow the [`ResourceAny`]
+    pub fn borrow(&self) -> ResourceAny {
+        Self {
+            idx: self.idx,
+            ty: self.ty,
+            own_state: None,
+        }
+    }
+
     /// Returns whether this is an owned resource, and if not it's a borrowed
     /// resource.
     pub fn owned(&self) -> bool {
