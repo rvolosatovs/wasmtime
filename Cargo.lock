@@ -1810,6 +1810,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d8adc4bb1803a324070e64a98ae98f38934d91957a99cfb3a43dcbc01bc56439"
 
 [[package]]
+name = "libffi-sys"
+version = "2.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f36115160c57e8529781b4183c2bb51fdc1f6d6d1ed345591d84be7703befb3c"
+dependencies = [
+ "cc",
+]
+
+[[package]]
 name = "libfuzzer-sys"
 version = "0.4.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3774,6 +3783,7 @@ dependencies = [
  "wasmtime-test-macros",
  "wasmtime-wasi",
  "wasmtime-wasi-config",
+ "wasmtime-wasi-dl",
  "wasmtime-wasi-http",
  "wasmtime-wasi-keyvalue",
  "wasmtime-wasi-nn",
@@ -4055,6 +4065,20 @@ name = "wasmtime-wasi-config"
 version = "27.0.0"
 dependencies = [
  "anyhow",
+ "test-programs-artifacts",
+ "tokio",
+ "wasmtime",
+ "wasmtime-wasi",
+]
+
+[[package]]
+name = "wasmtime-wasi-dl"
+version = "27.0.0"
+dependencies = [
+ "anyhow",
+ "bitflags 2.6.0",
+ "libc",
+ "libffi-sys",
  "test-programs-artifacts",
  "tokio",
  "wasmtime",

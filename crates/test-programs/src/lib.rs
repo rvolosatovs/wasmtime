@@ -12,12 +12,14 @@ wit_bindgen::generate!({
             include wasi:http/imports@0.2.2;
             include wasi:config/imports@0.2.0-draft;
             include wasi:keyvalue/imports@0.2.0-draft;
+            include wasi:dl/imports@0.2.0-draft;
         }
     ",
     path: [
         "../wasi-http/wit",
         "../wasi-config/wit",
         "../wasi-keyvalue/wit",
+        "../wasi-dl/wit",
     ],
     world: "wasmtime:test/test",
     features: ["cli-exit-with-code"],

@@ -1,0 +1,176 @@
+package wasi:dl@0.2.0-draft;
+
+interface ffi {
+    /// Typed, well-aligned memory regions
+    resource alloc {
+        /// Allocates a new, typed, well-aligned memory region
+        new: static func(ty: ffi-type) -> result<alloc>;
+
+        /// Write a `outgoing-primitive` into the memory region
+        /// Fails if type of the region is not `ffi-type::primitive` or the value does not fit
+        write-primitive: func(v: outgoing-primitive) -> result;
+
+        /// Write a `outgoing-struct` into the memory region
+        /// Fails if type of the region is not `ffi-type::struct` or the value does not fit
+        write-struct: func(v: outgoing-struct) -> result;
+
+        /// Write a sting into the memory region
+        /// Fails if type of the region is not `ffi-type::primitive(primitive-type::pointer)`
+        write-string: func(v: string) -> result;
+
+
+        /// Reads a primitive from the memory region
+        /// Fails if type of the region is not `ffi-type::primitive`
+        read-primitive: func() -> result<incoming-primitive>;
+
+        /// Reads a struct from the memory region
+        /// Fails if type of the region is not `ffi-type::struct`
+        read-struct: func() -> result<incoming-struct>;
+
+        /// Reads a C string from the memory region
+        /// Fails if type of the region is not `ffi-type::primitive(primitive-type::pointer)`
+        read-string: func() -> result<string>;
+    }
+
+    enum primitive-type {
+        c-schar,
+        c-uchar,
+        c-short,
+        c-ushort,
+        c-int,
+        c-uint,
+        c-long,
+        c-ulong,
+        c-long-long,
+        c-ulong-long,
+        c-float,
+        c-double,
+        int8-t,
+        int16-t,
+        int32-t,
+        int64-t,
+        uint8-t,
+        uint16-t,
+        uint32-t,
+        uint64-t,
+        pointer,
+    }
+
+    resource struct-type {
+        constructor(fields: list<ffi-type>);
+    }
+
+    variant ffi-type {
+        primitive(primitive-type),
+        struct(struct-type),
+    }
+
+    resource outgoing-primitive {
+        constructor(ty: primitive-type);
+
+        set-s8:   func(v: s8)  -> result;
+        set-s16:  func(v: s16) -> result;
+        set-s32:  func(v: s32) -> result;
+        set-s64:  func(v: s64) -> result;
+        set-u8:   func(v: u8)  -> result;
+        set-u16:  func(v: u16) -> result;
+        set-u32:  func(v: u32) -> result;
+        set-u64:  func(v: u64) -> result;
+        set-f32:  func(v: f32) -> result;
+        set-f64:  func(v: f64) -> result;
+        set-addr: func(v: borrow<alloc>) -> result;
+
+        // TODO: Consider adding lower-level methods
+        // set-le: func(v: list<u8>) -> result;
+        // set-be: func(v: list<u8>) -> result;
+    }
+
+    resource outgoing-struct {
+        constructor(fields: list<outgoing-value>);
+    }
+
+    resource incoming-primitive {
+        get-s8:    func() -> result<s8>;
+        get-s16:   func() -> result<s16>;
+        get-s32:   func() -> result<s32>;
+        get-s64:   func() -> result<s64>;
+        get-u8:    func() -> result<u8>;
+        get-u16:   func() -> result<u16>;
+        get-u32:   func() -> result<u32>;
+        get-u64:   func() -> result<u64>;
+        get-f32:   func() -> result<f32>;
+        get-f64:   func() -> result<f64>;
+        get-alloc: func() -> result<alloc>;
+
+        // TODO: Consider adding lower-level methods
+        // set-le: func(v: list<u8>) -> result;
+        // set-be: func(v: list<u8>) -> result;
+    }
+
+    resource incoming-struct {
+        fields: func() -> list<incoming-value>;
+    }
+
+    variant outgoing-value {
+        primitive(outgoing-primitive),
+        struct(outgoing-struct),
+    }
+
+    variant incoming-value {
+        primitive(incoming-primitive),
+        struct(incoming-struct),
+    }
+
+    sizeof: func(ty: primitive-type) -> u8;
+}
+
+interface dll {
+    use ffi.{alloc, ffi-type, outgoing-value, incoming-value};
+
+    resource function {
+        /// Constructs a function from an opaque `alloc` and a type signature
+        /// Fails if type of `alloc` is not `ffi-type::primitive(primitive-type::pointer)`
+        from-alloc: static func(alloc: alloc, args: list<ffi-type>, ret: option<ffi-type>) -> result<function>;
+
+        /// Calls a function with specified arguments
+        /// Fails if argument types do not match function type signature
+        call: func(args: list<outgoing-value>) -> result<option<incoming-value>>;
+
+        /// Returns a function as an opaque `alloc` of `ffi-type::primitive(primitive-type::pointer)` type
+        get-alloc: func() -> alloc;
+    }
+
+    resource symbol {
+        /// Returns symbol as a typed `function`
+        get-function: func(args: list<ffi-type>, ret: option<ffi-type>) -> function;
+
+        /// Returns symbol as a typed `alloc`
+        get-alloc: func(ty: ffi-type) -> alloc;
+    }
+
+    /// `library::open` flags passed to `dlopen` by the host
+    flags open-flags {
+        lazy,
+        now,
+        global,
+        local,
+    }
+
+    resource library {
+        /// Opens a library using `dlopen`
+        open: static func(name: option<string>, flag: open-flags) -> result<library, string>;
+        // TODO: Add default() and next() ?
+
+        /// Gets a symbol from a library using `dlsym`
+        get: func(name: string) -> result<symbol, string>;
+    }
+
+    extension: func() -> string;
+    prefix: func() -> string;
+    suffix: func() -> string;
+}
+
+world imports {
+    /// The interface for wasi:dl/dll
+    import dll;
+}
