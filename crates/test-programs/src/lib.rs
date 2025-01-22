@@ -12,27 +12,54 @@ wit_bindgen::generate!({
             include wasi:http/imports@0.2.3;
             include wasi:config/imports@0.2.0-draft;
             include wasi:keyvalue/imports@0.2.0-draft;
-
-            include wasi:clocks/imports@0.3.0;
-            include wasi:random/imports@0.3.0;
         }
     ",
     path: [
-        "../wasi/src/p3/wit",
         "../wasi-http/src/p2/wit",
         "../wasi-config/src/p2/wit",
         "../wasi-keyvalue/src/p2/wit",
     ],
     world: "wasmtime:test/test",
     features: ["cli-exit-with-code"],
-    async: {
-         imports: [
-             "wasi:clocks/monotonic-clock@0.3.0#wait-for",
-             "wasi:clocks/monotonic-clock@0.3.0#wait-until",
-         ],
-    },
     generate_all,
 });
+
+pub mod p3 {
+    wit_bindgen::generate!({
+        // TODO: Remove inline WIT
+        inline: "
+            package wasi:cli@0.3.0;
+
+            interface run {
+                /// Run the program.
+                run: func() -> result;
+            }
+
+            world command {
+                include wasi:clocks/imports@0.3.0;
+                include wasi:random/imports@0.3.0;
+
+                export run;
+            }
+        ",
+        path: [
+            "../wasi/src/p3/wit",
+        ],
+        world: "wasi:cli/command",
+        default_bindings_module: "test_programs::p3",
+        pub_export_macro: true,
+        async: {
+             imports: [
+                 "wasi:clocks/monotonic-clock@0.3.0#wait-for",
+                 "wasi:clocks/monotonic-clock@0.3.0#wait-until",
+             ],
+             exports: [
+                 "wasi:cli/run@0.3.0#run",
+             ],
+        },
+        generate_all,
+    });
+}
 
 pub mod proxy {
     wit_bindgen::generate!({
@@ -43,15 +70,15 @@ pub mod proxy {
         with: {
             "wasi:http/types@0.2.3": crate::wasi::http::types,
             "wasi:http/outgoing-handler@0.2.3": crate::wasi::http::outgoing_handler,
-            "wasi:random/random@0.2.3": crate::wasi::random0_2_3::random,
+            "wasi:random/random@0.2.3": crate::wasi::random::random,
             "wasi:io/error@0.2.3": crate::wasi::io::error,
             "wasi:io/poll@0.2.3": crate::wasi::io::poll,
             "wasi:io/streams@0.2.3": crate::wasi::io::streams,
             "wasi:cli/stdout@0.2.3": crate::wasi::cli::stdout,
             "wasi:cli/stderr@0.2.3": crate::wasi::cli::stderr,
             "wasi:cli/stdin@0.2.3": crate::wasi::cli::stdin,
-            "wasi:clocks/monotonic-clock@0.2.3": crate::wasi::clocks0_2_3::monotonic_clock,
-            "wasi:clocks/wall-clock@0.2.3": crate::wasi::clocks0_2_3::wall_clock,
+            "wasi:clocks/monotonic-clock@0.2.3": crate::wasi::clocks::monotonic_clock,
+            "wasi:clocks/wall-clock@0.2.3": crate::wasi::clocks::wall_clock,
         },
     });
 }

@@ -26,6 +26,11 @@ impl WasiView for Ctx {
     }
 }
 
+#[cfg(feature = "p3")]
+impl wasmtime_wasi::p3::WasiView for Ctx {
+    type Data = Self;
+}
+
 fn prepare_workspace(exe_name: &str) -> Result<TempDir> {
     let prefix = format!("wasi_components_{exe_name}_");
     let tempdir = tempfile::Builder::new().prefix(&prefix).tempdir()?;

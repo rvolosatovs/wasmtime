@@ -15,7 +15,8 @@
 //! done using the `with` option to [`bindgen!`]:
 //!
 //! ```rust
-//! use wasmtime_wasi::{IoView, WasiCtx, ResourceTable, WasiView};
+//! use wasmtime_wasi::{IoView, WasiCtx, ResourceTable};
+//! use wasmtime_wasi::p3::WasiView;
 //! use wasmtime::{Result, Engine, Config};
 //! use wasmtime::component::Linker;
 //!
@@ -58,8 +59,11 @@
 //! impl IoView for MyState {
 //!     fn table(&mut self) -> &mut ResourceTable { &mut self.table }
 //! }
-//! impl WasiView for MyState {
+//! impl wasmtime_wasi::WasiView for MyState {
 //!     fn ctx(&mut self) -> &mut WasiCtx { &mut self.ctx }
+//! }
+//! impl wasmtime_wasi::p3::WasiView for MyState {
+//!     type Data = Self;
 //! }
 //!
 //! fn main() -> Result<()> {
@@ -152,24 +156,63 @@ pub mod sync {
     mod generated {
         wasmtime::component::bindgen!({
             path: "src/p3/wit",
-            // TODO: Use `command` once 0.3.0 released
-            //world: "wasi:cli/command",
-            world: "inline:wasi/command",
+            world: "wasi:cli/command",
+            // TODO: Remove inline WIT
             inline: "
-                package inline:wasi;
+                package wasi:cli@0.3.0;
+
+                interface run {
+                    /// Run the program.
+                    run: func() -> result;
+                }
 
                 world command {
                     include wasi:clocks/imports@0.3.0;
                     include wasi:random/imports@0.3.0;
+
+                    export run;
                 }
             ",
             tracing: true,
             trappable_imports: true,
+            concurrent_exports: true,
             with: {
+                // TODO: Re-enable these, currently doing so causes:
+                // ```
+                // error[E0277]: `U` cannot be sent between threads safely
+                //   --> crates/wasi/src/p3/bindings.rs:151:9
+                //    |
+                //151 | /         wasmtime::component::bindgen!({
+                //152 | |             path: "src/p3/wit",
+                //153 | |             // TODO: Use `command` once 0.3.0 released
+                //154 | |             //world: "wasi:cli/command",
+                //...   |
+                //172 | |             require_store_data_send: true,
+                //173 | |         });
+                //    | |__________^ `U` cannot be sent between threads safely
+                //    |
+                //note: required by a bound in `p3::bindings::async_io::wasi::random::random::add_to_linker`
+                //   --> crates/wasi/src/p3/bindings.rs:320:5
+                //    |
+                //320 | /     wasmtime::component::bindgen!({
+                //321 | |         path: "src/p3/wit",
+                //322 | |         // TODO: Use `command` once 0.3.0 released
+                //323 | |         //world: "wasi:cli/command",
+                //...   |
+                //346 | |         },
+                //347 | |     });
+                //    | |______^ required by this bound in `add_to_linker`
+                //    = note: this error originates in the macro `wasmtime::component::bindgen` (in Nightly builds, run with -Z macro-backtrace for more info)
+                //help: consider further restricting type parameter `U`
+                //    |
+                //173 |         }), U: std::marker::Send;
+                //    |           ++++++++++++++++++++++
+                // ```
+                //
                 // These interfaces come from the outer module, as it's
                 // sync/async agnostic.
-                "wasi:random": crate::p3::bindings::random,
-                "wasi:clocks/wall-clock": crate::p3::bindings::clocks::wall_clock,
+                //"wasi:random": crate::p3::bindings::random,
+                //"wasi:clocks/wall-clock": crate::p3::bindings::clocks::wall_clock,
             },
             require_store_data_send: true,
         });
@@ -321,19 +364,26 @@ pub mod sync {
 mod async_io {
     wasmtime::component::bindgen!({
         path: "src/p3/wit",
-        // TODO: Use `command` once 0.3.0 released
-        //world: "wasi:cli/command",
-        world: "inline:wasi/command",
+        world: "wasi:cli/command",
         inline: "
-            package inline:wasi;
+            package wasi:cli@0.3.0;
+
+            interface run {
+                /// Run the program.
+                run: func() -> result;
+            }
 
             world command {
                 include wasi:clocks/imports@0.3.0;
                 include wasi:random/imports@0.3.0;
+
+                export run;
             }
         ",
         tracing: true,
         trappable_imports: true,
+        concurrent_imports: true,
+        concurrent_exports: true,
         async: {
             // Only these functions are `async` and everything else is sync
             // meaning that it basically doesn't need to block. These functions
@@ -343,8 +393,8 @@ mod async_io {
             // which in theory can be shared across interfaces, so this may
             // need fancier syntax in the future.
             only_imports: [
-                "wait-for",
-                "wait-until",
+                "wasi:clocks/monotonic-clock@0.3.0#wait-for",
+                "wasi:clocks/monotonic-clock@0.3.0#wait-until",
             ],
         },
     });

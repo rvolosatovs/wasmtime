@@ -3,7 +3,20 @@ use core::pin::pin;
 use core::ptr;
 use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
-use test_programs::wasi::clocks0_3_0::monotonic_clock;
+use test_programs::p3::wasi::clocks::monotonic_clock;
+
+struct Component;
+
+test_programs::p3::export!(Component);
+
+impl test_programs::p3::exports::wasi::cli::run::Guest for Component {
+    async fn run() -> Result<(), ()> {
+        sleep_10ms().await;
+        sleep_0ms();
+        sleep_backwards_in_time();
+        Ok(())
+    }
+}
 
 // Adapted from https://github.com/rust-lang/rust/blob/cd805f09ffbfa3896c8f50a619de9b67e1d9f3c3/library/core/src/task/wake.rs#L63-L77
 // TODO: Replace by `Waker::noop` once MSRV is raised to 1.85
@@ -22,13 +35,6 @@ const NOOP_RAW_WAKER: RawWaker = {
 };
 
 const NOOP_WAKER: &'static Waker = &unsafe { Waker::from_raw(NOOP_RAW_WAKER) };
-
-#[tokio::main(flavor = "current_thread")]
-async fn main() {
-    sleep_10ms().await;
-    sleep_0ms();
-    sleep_backwards_in_time();
-}
 
 async fn sleep_10ms() {
     let dur = 10_000_000;
@@ -60,3 +66,5 @@ fn sleep_backwards_in_time() {
         "waiting until instant which has passed is ready immediately",
     );
 }
+
+fn main() {}

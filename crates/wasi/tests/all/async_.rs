@@ -1,4 +1,5 @@
 use super::*;
+use anyhow::Context as _;
 use std::path::Path;
 use test_programs_artifacts::*;
 use wasmtime_wasi::p2::bindings::Command;
@@ -12,9 +13,6 @@ async fn run(path: &str, inherit_stdio: bool) -> Result<()> {
     let mut linker = Linker::new(&engine);
     wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
 
-    #[cfg(feature = "p3")]
-    wasmtime_wasi::p3::add_to_linker_sync(&mut linker)?;
-
     let (mut store, _td) = store(&engine, name, |builder| {
         if inherit_stdio {
             builder.inherit_stdio();
@@ -26,6 +24,37 @@ async fn run(path: &str, inherit_stdio: bool) -> Result<()> {
         .wasi_cli_run()
         .call_run(&mut store)
         .await?
+        .map_err(|()| anyhow::anyhow!("run returned a failure"))
+}
+
+#[cfg(feature = "p3")]
+async fn run_p3(path: &str, inherit_stdio: bool) -> Result<()> {
+    let path = Path::new(path);
+    let name = path.file_stem().unwrap().to_str().unwrap();
+    let engine = test_programs_artifacts::engine(|config| {
+        config.async_support(true);
+        config.wasm_component_model_async(true);
+    });
+    let mut linker = Linker::new(&engine);
+    wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
+    wasmtime_wasi::p3::add_to_linker_async(&mut linker)?;
+
+    let (mut store, _td) = store(&engine, name, |builder| {
+        if inherit_stdio {
+            builder.inherit_stdio();
+        }
+    })?;
+    let component = Component::from_file(&engine, path)?;
+    let command =
+        wasmtime_wasi::p3::bindings::Command::instantiate_async(&mut store, &component, &linker)
+            .await?;
+    let mut promises = wasmtime::component::PromisesUnordered::new();
+    promises.push(command.wasi_cli_run().call_run(&mut store).await?);
+    promises
+        .next(&mut store)
+        .await
+        .context("failed to get promise")?
+        .context("promise missing")?
         .map_err(|()| anyhow::anyhow!("run returned a failure"))
 }
 
@@ -408,10 +437,10 @@ async fn preview2_file_read_write() {
 #[cfg(feature = "p3")]
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
 async fn preview3_sleep() {
-    run(PREVIEW3_SLEEP_COMPONENT, false).await.unwrap()
+    run_p3(PREVIEW3_SLEEP_COMPONENT, false).await.unwrap()
 }
 #[cfg(feature = "p3")]
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
 async fn preview3_random() {
-    run(PREVIEW3_RANDOM_COMPONENT, false).await.unwrap()
+    run_p3(PREVIEW3_RANDOM_COMPONENT, false).await.unwrap()
 }

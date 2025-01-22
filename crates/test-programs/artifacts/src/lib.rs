@@ -71,7 +71,6 @@ fn cache_store() -> Arc<dyn CacheStore> {
 pub fn engine(configure: impl FnOnce(&mut Config)) -> Engine {
     let mut config = Config::new();
     config.wasm_component_model(true);
-    config.wasm_component_model_async(true);
     config
         .enable_incremental_compilation(cache_store())
         .unwrap();

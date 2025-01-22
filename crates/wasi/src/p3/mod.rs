@@ -11,10 +11,22 @@
 
 use wasmtime::component::Linker;
 
-use crate::{type_annotate, IoImpl, WasiImpl, WasiView};
+use crate::{type_annotate, IoImpl, WasiImpl};
 
 pub mod bindings;
 pub(crate) mod host;
+
+pub trait WasiView: crate::WasiView {
+    type Data;
+}
+
+impl<T: WasiView> WasiView for &mut T {
+    type Data = T;
+}
+
+impl<T: WasiView> WasiView for crate::WasiImpl<T> {
+    type Data = T;
+}
 
 /// Add all WASI interfaces from this module into the `linker` provided.
 ///
@@ -74,7 +86,7 @@ pub(crate) mod host;
 ///     fn ctx(&mut self) -> &mut WasiCtx { &mut self.ctx }
 /// }
 /// ```
-pub fn add_to_linker_async<T: WasiView>(linker: &mut Linker<T>) -> anyhow::Result<()> {
+pub fn add_to_linker_async<T: WasiView + 'static>(linker: &mut Linker<T>) -> anyhow::Result<()> {
     let l = linker;
     let closure = type_annotate::<T, _>(|t| WasiImpl(IoImpl(t)));
 
@@ -141,7 +153,7 @@ pub fn add_to_linker_async<T: WasiView>(linker: &mut Linker<T>) -> anyhow::Resul
 ///     fn ctx(&mut self) -> &mut WasiCtx { &mut self.ctx }
 /// }
 /// ```
-pub fn add_to_linker_sync<T: WasiView>(
+pub fn add_to_linker_sync<T: WasiView + 'static>(
     linker: &mut wasmtime::component::Linker<T>,
 ) -> anyhow::Result<()> {
     let l = linker;
