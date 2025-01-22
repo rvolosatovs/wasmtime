@@ -172,7 +172,7 @@ fn compile_component(wasm: &Path, adapter: &[u8]) -> PathBuf {
     let component = ComponentEncoder::default()
         .module(module.as_slice())
         .unwrap()
-        .validate(false)
+        .validate(false) // TODO: Reenable validation
         .adapter("wasi_snapshot_preview1", adapter)
         .unwrap()
         .encode()
