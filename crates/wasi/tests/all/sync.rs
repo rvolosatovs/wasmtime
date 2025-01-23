@@ -28,48 +28,8 @@ fn run(path: &str, inherit_stdio: bool) -> Result<()> {
     Ok(())
 }
 
-#[cfg(feature = "p3")]
-fn run_p3(path: &str, inherit_stdio: bool) -> Result<()> {
-    let path = Path::new(path);
-    let name = path.file_stem().unwrap().to_str().unwrap();
-    let engine = test_programs_artifacts::engine(|config| {
-        config.wasm_component_model_async(true);
-    });
-    let mut linker = Linker::new(&engine);
-    wasmtime_wasi::p2::add_to_linker_sync(&mut linker)?;
-    wasmtime_wasi::p3::add_to_linker_sync(&mut linker)?;
-
-    let component = Component::from_file(&engine, path)?;
-
-    for blocking in [false, true] {
-        let (mut store, _td) = store(&engine, name, |builder| {
-            if inherit_stdio {
-                builder.inherit_stdio();
-            }
-            builder.allow_blocking_current_thread(blocking);
-        })?;
-        let _command = wasmtime_wasi::p3::bindings::sync::Command::instantiate(
-            &mut store, &component, &linker,
-        )?;
-        // NOTE: this currently fails with:
-        // ```
-        // thread 'sync::preview3_sleep' panicked at /Users/rvolosatovs/src/github.com/bytecodealliance/wasmtime/crates/wasmtime/src/runtime/component/concurrent.rs:381:30:
-        // called `Option::unwrap()` on a `None` value
-        // ```
-        // TODO: Figure out if `sync` support is at all feasible for wasip3
-        //command
-        //    .wasi_cli_run()
-        //    .call_run(&mut store)?
-        //    .map_err(|()| anyhow::anyhow!("run returned a failure"))?;
-    }
-    Ok(())
-}
-
 foreach_preview1!(assert_test_exists);
 foreach_preview2!(assert_test_exists);
-
-#[cfg(feature = "p3")]
-foreach_preview3!(assert_test_exists);
 
 // Below here is mechanical: there should be one test for every binary in
 // wasi-tests.
@@ -371,15 +331,4 @@ fn preview2_adapter_badfd() {
 #[test_log::test]
 fn preview2_file_read_write() {
     run(PREVIEW2_FILE_READ_WRITE_COMPONENT, false).unwrap()
-}
-
-#[cfg(feature = "p3")]
-#[test_log::test]
-fn preview3_sleep() {
-    run_p3(PREVIEW3_SLEEP_COMPONENT, false).unwrap()
-}
-#[cfg(feature = "p3")]
-#[test_log::test]
-fn preview3_random() {
-    run_p3(PREVIEW3_RANDOM_COMPONENT, false).unwrap()
 }

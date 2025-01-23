@@ -11,8 +11,6 @@ use crate::p3::bindings::{
 };
 use crate::{WasiImpl, WasiView as _};
 
-mod sync;
-
 impl TryFrom<SystemTime> for Datetime {
     type Error = wasmtime::Error;
 
