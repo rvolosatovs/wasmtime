@@ -1,3 +1,4 @@
+use crate::ValRaw;
 #[cfg(feature = "component-model-async")]
 use crate::component::concurrent::Accessor;
 use crate::component::func::HostFunc;
@@ -12,6 +13,7 @@ use crate::prelude::*;
 use crate::{AsContextMut, Engine, Module, StoreContextMut};
 use alloc::sync::Arc;
 use core::marker;
+use core::mem::MaybeUninit;
 #[cfg(feature = "async")]
 use core::{future::Future, pin::Pin};
 use wasmtime_environ::PrimaryMap;
@@ -671,6 +673,37 @@ impl<T: 'static> LinkerInstance<'_, T> {
         + 'static,
     ) -> Result<()> {
         self.insert(name, Definition::Func(HostFunc::new_dynamic(func)))?;
+        Ok(())
+    }
+
+    /// Creates a [`Func::new_unchecked`]-style function named in this linker.
+    ///
+    /// For more information see [`Linker::func_wrap`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if the given function type is not associated with the same engine
+    /// as this linker.
+    ///
+    /// # Safety
+    ///
+    /// See [`Func::new_unchecked`] for more safety information.
+    pub unsafe fn func_new_unchecked(
+        &mut self,
+        name: &str,
+        func: impl Fn(
+            StoreContextMut<'_, T>,
+            types::ComponentFunc,
+            &mut [MaybeUninit<ValRaw>],
+        ) -> Result<()>
+        + Send
+        + Sync
+        + 'static,
+    ) -> Result<()> {
+        self.insert(
+            name,
+            Definition::Func(unsafe { HostFunc::new_unchecked(func) }),
+        )?;
         Ok(())
     }
 

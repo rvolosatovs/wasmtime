@@ -1334,6 +1334,13 @@ name = "example-fib-debug-wasm"
 version = "0.0.0"
 
 [[package]]
+name = "example-native-plugin-wasm"
+version = "0.0.0"
+dependencies = [
+ "wit-bindgen 0.46.0",
+]
+
+[[package]]
 name = "example-resource-component-wasm"
 version = "0.1.0"
 dependencies = [
@@ -2439,6 +2446,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "native-plugin"
+version = "39.0.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "libloading",
+ "wasmtime",
+ "wasmtime-wasi",
+]
+
+[[package]]
 name = "native-tls"
 version = "0.2.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3123,6 +3141,13 @@ dependencies = [
  "libc",
  "untrusted",
  "windows-sys 0.52.0",
+]
+
+[[package]]
+name = "rust-plugin"
+version = "39.0.0"
+dependencies = [
+ "wit-bindgen 0.46.0",
 ]
 
 [[package]]

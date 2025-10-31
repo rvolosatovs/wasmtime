@@ -118,6 +118,25 @@ impl HostFunc {
         }
     }
 
+    pub(crate) unsafe fn new_unchecked<T, F>(func: F) -> Arc<HostFunc>
+    where
+        T: 'static,
+        F: Fn(StoreContextMut<'_, T>, ComponentFunc, &mut [MaybeUninit<ValRaw>]) -> Result<()>
+            + Send
+            + Sync
+            + 'static,
+    {
+        let entrypoint = raw_entrypoint::<T, F>;
+        Arc::new(HostFunc {
+            entrypoint,
+            // This function performs external type checks and subsequently does
+            // not need to perform up-front type checks. Instead everything is
+            // dynamically managed at runtime.
+            typecheck: Box::new(move |_expected_index, _expected_types| Ok(())),
+            func: Box::new(func),
+        })
+    }
+
     fn new_dynamic_canonical<T, F>(func: F) -> Arc<HostFunc>
     where
         F: Fn(
@@ -664,6 +683,55 @@ where
     }
 }
 
+unsafe fn call_raw<T, F>(
+    mut store: StoreContextMut<'_, T>,
+    instance: Instance,
+    ty: TypeFuncIndex,
+    options_idx: OptionsIndex,
+    storage: &mut [MaybeUninit<ValRaw>],
+    closure: F,
+) -> Result<()>
+where
+    F: Fn(StoreContextMut<'_, T>, ComponentFunc, &mut [MaybeUninit<ValRaw>]) -> Result<()>
+        + Send
+        + Sync
+        + 'static,
+{
+    let options = Options::new_index(store.0, instance, options_idx);
+    let vminstance = instance.id().get(store.0);
+    let opts = &vminstance.component().env_component().options[options_idx];
+    let caller_instance = opts.instance;
+    let mut flags = vminstance.instance_flags(caller_instance);
+
+    // Perform a dynamic check that this instance can indeed be left. Exiting
+    // the component is disallowed, for example, when the `realloc` function
+    // calls a canonical import.
+    if unsafe { !flags.may_leave() } {
+        return Err(anyhow!(crate::Trap::CannotLeaveComponent));
+    }
+
+    let types = instance.id().get(store.0).component().types().clone();
+
+    let lift = &mut LiftContext::new(store.0.store_opaque_mut(), &options, instance);
+    lift.enter_call();
+    let ty = ComponentFunc::from(ty, &lift.instance_type());
+
+    // TODO: Handle resources and async
+
+    closure(store.as_context_mut(), ty, storage)?;
+
+    unsafe {
+        flags.set_may_leave(false);
+    }
+    let mut lower = LowerContext::new(store, &options, &types, instance);
+    unsafe {
+        flags.set_may_leave(true);
+    }
+    lower.exit_call()?;
+
+    return Ok(());
+}
+
 pub(crate) fn validate_inbounds<T: ComponentType>(memory: &[u8], ptr: &ValRaw) -> Result<usize> {
     // FIXME(#4311): needs memory64 support
     let ptr = usize::try_from(ptr.get_u32())?;
@@ -914,6 +982,36 @@ pub(crate) fn validate_inbounds_dynamic(
         bail!("pointer out of bounds")
     }
     Ok(ptr)
+}
+
+extern "C" fn raw_entrypoint<T, F>(
+    cx: NonNull<VMOpaqueContext>,
+    data: NonNull<u8>,
+    ty: u32,
+    options: u32,
+    storage: NonNull<MaybeUninit<ValRaw>>,
+    storage_len: usize,
+) -> bool
+where
+    F: Fn(StoreContextMut<'_, T>, ComponentFunc, &mut [MaybeUninit<ValRaw>]) -> Result<()>
+        + Send
+        + Sync
+        + 'static,
+    T: 'static,
+{
+    let data = SendSyncPtr::new(NonNull::new(data.as_ptr() as *mut F).unwrap());
+    unsafe {
+        call_host_and_handle_result(cx, |store, instance| {
+            call_raw::<T, _>(
+                store,
+                instance,
+                TypeFuncIndex::from_u32(ty),
+                OptionsIndex::from_u32(options),
+                NonNull::slice_from_raw_parts(storage, storage_len).as_mut(),
+                &*data.as_ptr(),
+            )
+        })
+    }
 }
 
 extern "C" fn dynamic_entrypoint<T, F>(

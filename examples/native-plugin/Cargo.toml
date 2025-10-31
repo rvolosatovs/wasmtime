@@ -1,0 +1,17 @@
+[package]
+name = "native-plugin"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true, features = ["derive"] }
+libloading = "0.8"
+wasmtime = { workspace = true, features = ["std", "cranelift"] }
+wasmtime-wasi = { workspace = true }
+
+[lints]
+workspace = true

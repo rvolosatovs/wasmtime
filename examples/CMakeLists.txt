@@ -59,6 +59,7 @@ create_rust_wasm(wasi wasm32-wasip1)
 create_rust_wasm(wasi wasm32-wasip2)
 create_rust_wasm(component wasm32-unknown-unknown)
 create_rust_wasm(resource-component wasm32-wasip2)
+create_rust_wasm(native-plugin wasm32-wasip2)
 
 # C/C++ examples/tests
 create_target(anyref anyref.c)

@@ -1,0 +1,15 @@
+[package]
+name = "rust-plugin"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+wit-bindgen = { workspace = true, features = ["default"] }
+
+[lib]
+path = "plugin.rs"
+name = "rust_plugin"
+crate-type = ["cdylib"]

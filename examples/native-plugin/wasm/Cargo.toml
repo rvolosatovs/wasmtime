@@ -1,0 +1,14 @@
+[package]
+name = "example-native-plugin-wasm"
+version = "0.0.0"
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+wit-bindgen = { workspace = true, default-features = true }
+
+[[bin]]
+path = "guest.rs"
+name = "native-plugin"
