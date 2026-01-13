@@ -1,5 +1,4 @@
 use crate::p3::{TlsStream, TlsStreamArc};
-use anyhow::Context as _;
 use core::ops::DerefMut;
 use core::pin::Pin;
 use core::task::{Context, Poll, Waker};
@@ -9,6 +8,7 @@ use wasmtime::StoreContextMut;
 use wasmtime::component::{
     Destination, FutureProducer, Source, StreamConsumer, StreamProducer, StreamResult,
 };
+use wasmtime::error::Context as _;
 
 mod client;
 mod server;
@@ -22,7 +22,7 @@ macro_rules! mk_push {
             table: &mut wasmtime::component::ResourceTable,
             value: $t,
         ) -> wasmtime::Result<wasmtime::component::Resource<$t>> {
-            use anyhow::Context as _;
+            use wasmtime::error::Context as _;
 
             table
                 .push(value)
@@ -39,7 +39,7 @@ macro_rules! mk_get {
             table: &'a wasmtime::component::ResourceTable,
             resource: &'a wasmtime::component::Resource<$t>,
         ) -> wasmtime::Result<&'a $t> {
-            use anyhow::Context as _;
+            use wasmtime::error::Context as _;
 
             table
                 .get(resource)
@@ -56,7 +56,7 @@ macro_rules! mk_get_mut {
             table: &'a mut wasmtime::component::ResourceTable,
             resource: &'a wasmtime::component::Resource<$t>,
         ) -> wasmtime::Result<&'a mut $t> {
-            use anyhow::Context as _;
+            use wasmtime::error::Context as _;
 
             table.get_mut(resource).context(concat!(
                 "failed to get ",
@@ -75,7 +75,7 @@ macro_rules! mk_delete {
             table: &mut wasmtime::component::ResourceTable,
             resource: wasmtime::component::Resource<$t>,
         ) -> wasmtime::Result<$t> {
-            use anyhow::Context as _;
+            use wasmtime::error::Context as _;
 
             table.delete(resource).context(concat!(
                 "failed to delete ",
@@ -353,7 +353,7 @@ impl<D> FutureProducer<D> for ResultProducer {
         cx: &mut Context<'_>,
         _store: StoreContextMut<D>,
         finish: bool,
-    ) -> Poll<anyhow::Result<Option<Self::Item>>> {
+    ) -> Poll<wasmtime::error::Result<Option<Self::Item>>> {
         match Pin::new(&mut self.0).poll(cx) {
             Poll::Ready(Ok(_err)) => Poll::Ready(Ok(Some(Err(())))),
             Poll::Ready(Err(..)) => Poll::Ready(Ok(Some(Ok(())))),

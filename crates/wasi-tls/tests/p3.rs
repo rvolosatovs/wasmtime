@@ -1,6 +1,7 @@
 #![cfg(feature = "p3")]
 
 use wasmtime::component::{Component, Linker, ResourceTable};
+use wasmtime::error::Context as _;
 use wasmtime::{Result, Store, format_err};
 use wasmtime_wasi::p3::bindings::Command;
 use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
@@ -59,12 +60,17 @@ async fn run_test(path: &str) -> Result<()> {
     let command = Command::instantiate_async(&mut store, &component, &linker)
         .await
         .context("failed to instantiate `wasi:cli/command`")?;
-    store
+    let (res, _task) = store
         .run_concurrent(async move |store| command.wasi_cli_run().call_run(store).await)
         .await
         .context("failed to call `wasi:cli/run#run`")?
-        .context("guest trapped")?
-        .map_err(|()| format_err!("`wasi:cli/run#run` failed"))
+        .context("guest trapped")?;
+    res.map_err(|()| format_err!("`wasi:cli/run#run` failed"))?;
+    // TODO: Ensure all tasks exit
+    //store
+    //    .run_concurrent(async move |store| task.block(store).await)
+    //    .await
+    Ok(())
 }
 
 macro_rules! assert_test_exists {

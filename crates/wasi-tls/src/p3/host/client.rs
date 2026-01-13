@@ -7,7 +7,6 @@ use crate::p3::bindings::tls::client::{
 };
 use crate::p3::bindings::tls::types::Certificate;
 use crate::p3::{TlsStream, TlsStreamClientArc, WasiTls, WasiTlsCtxView};
-use anyhow::{Context as _, anyhow, bail};
 use core::mem;
 use core::net::{IpAddr, Ipv4Addr};
 use core::pin::{Pin, pin};
@@ -16,8 +15,9 @@ use rustls::client::ResolvesClientCert;
 use rustls::pki_types::ServerName;
 use std::sync::{Arc, Mutex};
 use tokio::sync::oneshot;
-use wasmtime::StoreContextMut;
 use wasmtime::component::{Access, FutureProducer, FutureReader, Resource, StreamReader};
+use wasmtime::error::Context as _;
+use wasmtime::{StoreContextMut, bail, format_err};
 
 mk_push!(Hello, push_hello, "client hello");
 mk_get_mut!(Hello, get_hello_mut, "client hello");
@@ -49,7 +49,7 @@ where
         cx: &mut Context<'_>,
         mut store: StoreContextMut<D>,
         finish: bool,
-    ) -> Poll<anyhow::Result<Option<Self::Item>>> {
+    ) -> Poll<wasmtime::Result<Option<Self::Item>>> {
         let this = self.get_mut();
         let Self::Pending {
             stream,
@@ -57,7 +57,7 @@ where
             getter,
         } = mem::take(this)
         else {
-            return Poll::Ready(Err(anyhow!("polled after ready")));
+            return Poll::Ready(Err(format_err!("polled after ready")));
         };
         if let Poll::Ready(..) = pin!(&mut error_rx).poll(cx) {
             return Poll::Ready(Ok(Some(Err(()))));

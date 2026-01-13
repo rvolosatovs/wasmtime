@@ -6,18 +6,18 @@ use crate::p3::bindings::tls::server::{
 };
 use crate::p3::bindings::tls::types::Certificate;
 use crate::p3::{TlsStream, TlsStreamServerArc, WasiTls, WasiTlsCtxView};
-use anyhow::{Context as _, anyhow};
 use core::mem;
 use core::pin::Pin;
 use core::task::{Context, Poll};
 use rustls::server::ResolvesServerCert;
 use std::sync::{Arc, Mutex};
 use tokio::sync::oneshot;
-use wasmtime::StoreContextMut;
 use wasmtime::component::{
     Access, Accessor, Destination, FutureReader, Resource, Source, StreamConsumer, StreamProducer,
     StreamReader, StreamResult,
 };
+use wasmtime::error::Context as _;
+use wasmtime::{StoreContextMut, format_err};
 
 mk_delete!(Handshake, delete_handshake, "server handshake");
 mk_get!(Handshake, get_handshake, "server handshake");
@@ -92,7 +92,7 @@ impl<D> StreamConsumer<D> for CiphertextConsumer {
                 }
             },
             Self::Active(ref mut conn) => Pin::new(conn).poll_consume(cx, store, src, finish),
-            Self::Corrupted => Poll::Ready(Err(anyhow!("corrupted stream consumer state"))),
+            Self::Corrupted => Poll::Ready(Err(format_err!("corrupted stream consumer state"))),
         }
     }
 }
@@ -132,7 +132,7 @@ impl<D> StreamProducer<D> for CiphertextProducer {
                 }
             },
             Self::Active(ref mut conn) => Pin::new(conn).poll_produce(cx, store, dst, finish),
-            Self::Corrupted => Poll::Ready(Err(anyhow!("corrupted stream producer state"))),
+            Self::Corrupted => Poll::Ready(Err(format_err!("corrupted stream producer state"))),
         }
     }
 }
