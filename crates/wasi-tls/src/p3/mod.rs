@@ -14,7 +14,7 @@ mod host;
 use core::task::Waker;
 use std::sync::{Arc, Mutex};
 
-use bindings::tls::{client, server, types};
+use bindings::tls::{client, types};
 use rustls::pki_types::ServerName;
 use tokio::sync::oneshot;
 use wasmtime::component::{HasData, Linker, ResourceTable};
@@ -103,10 +103,13 @@ where
     T: WasiTlsView + 'static,
 {
     client::add_to_linker::<_, WasiTls>(linker, T::tls)?;
-    server::add_to_linker::<_, WasiTls>(linker, T::tls)?;
     types::add_to_linker::<_, WasiTls>(linker, T::tls)?;
     Ok(())
 }
+
+/// Conn
+#[derive(Default)]
+pub struct Connector;
 
 /// Client hello
 #[derive(Clone, Default, Eq, PartialEq, Hash)]

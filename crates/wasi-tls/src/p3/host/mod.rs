@@ -11,7 +11,6 @@ use wasmtime::component::{
 use wasmtime::error::Context as _;
 
 mod client;
-mod server;
 mod types;
 
 macro_rules! mk_push {
