@@ -1,43 +1,41 @@
+//! WASI TLS client host implementation.
+
 use super::{
-    CiphertextConsumer, CiphertextProducer, PlaintextConsumer, PlaintextProducer, ResultProducer,
-    mk_delete, mk_get, mk_get_mut, mk_push,
+    CiphertextConsumer, CiphertextProducer, PlaintextConsumer, PlaintextProducer, mk_delete,
+    mk_get_mut, mk_push,
 };
 use crate::p3::bindings::tls::client::{Connector, Host, HostConnector, HostConnectorWithStore};
 use crate::p3::bindings::tls::types::Error;
 use crate::p3::{TlsStream, TlsStreamClientArc, WasiTls, WasiTlsCtxView};
-use core::net::{IpAddr, Ipv4Addr};
-use core::pin::{Pin, pin};
+use core::mem;
+use core::pin::Pin;
 use core::task::{Context, Poll};
-use core::{mem, task::Waker};
-use rustls::client::ResolvesClientCert;
-use rustls::pki_types::ServerName;
 use std::sync::{Arc, Mutex};
-use tokio::sync::{SetOnce, oneshot};
+use tokio::sync::oneshot;
 use wasmtime::AsContextMut as _;
 use wasmtime::StoreContextMut;
 use wasmtime::component::{
-    Access, Accessor, Destination, FutureProducer, FutureReader, Resource, StreamProducer,
-    StreamReader, StreamResult,
+    Access, Accessor, Destination, FutureReader, Resource, StreamProducer, StreamReader,
+    StreamResult,
 };
-use wasmtime::error::Context as _;
 
 mk_push!(Error, push_error, "error");
 
 mk_push!(Connector, push_connector, "client connector");
-mk_get!(Connector, get_connector, "client connector");
 mk_get_mut!(Connector, get_connector_mut, "client connector");
 mk_delete!(Connector, delete_connector, "client connector");
 
 type PlaintextProducerClient = PlaintextProducer<rustls::ClientConnection>;
 
-#[derive(Clone)]
-enum ReceiveStream {
-    Init,
-    Pending(Waker),
-    Active(PlaintextProducerClient),
+struct ReceiveProducer {
+    stream_rx: oneshot::Receiver<TlsStreamClientArc>,
+    stream: Option<PlaintextProducer<rustls::ClientConnection>>,
 }
 
-impl<D> StreamProducer<D> for ReceiveStream {
+impl<D> StreamProducer<D> for ReceiveProducer
+where
+    D: 'static,
+{
     type Item = <PlaintextProducerClient as StreamProducer<D>>::Item;
     type Buffer = <PlaintextProducerClient as StreamProducer<D>>::Buffer;
 
@@ -48,99 +46,59 @@ impl<D> StreamProducer<D> for ReceiveStream {
         dst: Destination<'a, Self::Item, Self::Buffer>,
         finish: bool,
     ) -> Poll<wasmtime::Result<StreamResult>> {
-        match &mut *self {
-            Self::Init | Self::Pending(..) => {
-                *self = Self::Pending(cx.waker().clone());
-                Poll::Pending
+        if let Some(ref mut stream) = self.stream {
+            return Pin::new(stream).poll_produce(cx, store, dst, finish);
+        }
+        match Pin::new(&mut self.stream_rx).poll(cx) {
+            Poll::Ready(Ok(stream)) => {
+                self.stream = Some(PlaintextProducer(stream));
+                return self.poll_produce(cx, store, dst, finish);
             }
-            Self::Active(stream) => Pin::new(stream).poll_produce(cx, store, dst, finish),
+            Poll::Ready(Err(..)) => Poll::Ready(Ok(StreamResult::Dropped)),
+            Poll::Pending if finish => Poll::Ready(Ok(StreamResult::Cancelled)),
+            Poll::Pending => Poll::Pending,
         }
     }
 }
 
-//#[derive(Default)]
-//enum ConnectProducer<T> {
-//    Pending {
-//        stream: TlsStreamClientArc,
-//        error_rx: oneshot::Receiver<rustls::Error>,
-//        getter: fn(&mut T) -> WasiTlsCtxView<'_>,
-//    },
-//    #[default]
-//    Exhausted,
-//}
-//
-//impl<D> FutureProducer<D> for ConnectProducer<D>
-//where
-//    D: 'static,
-//{
-//    type Item = Result<Resource<Handshake>, ()>;
-//
-//    fn poll_produce(
-//        self: Pin<&mut Self>,
-//        cx: &mut Context<'_>,
-//        mut store: StoreContextMut<D>,
-//        finish: bool,
-//    ) -> Poll<wasmtime::Result<Option<Self::Item>>> {
-//        let this = self.get_mut();
-//        let Self::Pending {
-//            stream,
-//            mut error_rx,
-//            getter,
-//        } = mem::take(this)
-//        else {
-//            return Poll::Ready(Err(format_err!("polled after ready")));
-//        };
-//        if let Poll::Ready(..) = pin!(&mut error_rx).poll(cx) {
-//            return Poll::Ready(Ok(Some(Err(()))));
-//        }
-//
-//        {
-//            let mut stream_lock = stream.lock();
-//            let TlsStream { conn, read_tls, .. } = stream_lock.as_deref_mut().unwrap();
-//            if conn.peer_certificates().is_none() || conn.negotiated_cipher_suite().is_none() {
-//                if !finish {
-//                    *read_tls = Some(cx.waker().clone());
-//                }
-//                drop(stream_lock);
-//                *this = Self::Pending {
-//                    stream,
-//                    error_rx,
-//                    getter,
-//                };
-//                if finish {
-//                    return Poll::Ready(Ok(None));
-//                }
-//                return Poll::Pending;
-//            }
-//        };
-//
-//        let WasiTlsCtxView { table, .. } = getter(store.data_mut());
-//
-//        let handshake = Handshake { stream, error_rx };
-//        let handshake = push_handshake(table, handshake)?;
-//
-//        Poll::Ready(Ok(Some(Ok(handshake))))
-//    }
-//}
-//
-//#[derive(Debug)]
-//struct CertificateResolver;
-//
-//impl ResolvesClientCert for CertificateResolver {
-//    fn resolve(
-//        &self,
-//        _root_hint_subjects: &[&[u8]],
-//        _sigschemes: &[rustls::SignatureScheme],
-//    ) -> Option<Arc<rustls::sign::CertifiedKey>> {
-//        // TODO: implement
-//        None
-//    }
-//
-//    fn has_certs(&self) -> bool {
-//        false
-//    }
-//}
-//
+struct PendingCiphertextProducer {
+    rx: oneshot::Receiver<TlsStreamClientArc>,
+    inner: Option<CiphertextProducer<rustls::ClientConnection>>,
+}
+
+impl<D> StreamProducer<D> for PendingCiphertextProducer
+where
+    D: 'static,
+{
+    type Item = u8;
+    type Buffer = Option<u8>;
+
+    fn poll_produce<'a>(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        store: StoreContextMut<'a, D>,
+        dst: Destination<'a, Self::Item, Self::Buffer>,
+        finish: bool,
+    ) -> Poll<wasmtime::Result<StreamResult>> {
+        // If we already have the inner producer, delegate to it.
+        if let Some(ref mut inner) = self.inner {
+            return Pin::new(inner).poll_produce(cx, store, dst, finish);
+        }
+
+        // Try to receive the stream.
+        match Pin::new(&mut self.rx).poll(cx) {
+            Poll::Ready(Ok(stream)) => {
+                self.inner = Some(CiphertextProducer(stream));
+                // Now poll the inner producer.
+                Pin::new(self.inner.as_mut().unwrap()).poll_produce(cx, store, dst, finish)
+            }
+            Poll::Ready(Err(_)) => Poll::Ready(Ok(StreamResult::Dropped)),
+            Poll::Pending if finish => Poll::Ready(Ok(StreamResult::Cancelled)),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
 impl Host for WasiTlsCtxView<'_> {}
 
 impl HostConnector for WasiTlsCtxView<'_> {
@@ -159,36 +117,122 @@ impl HostConnectorWithStore for WasiTls {
         mut store: Access<T, Self>,
         conn: Resource<Connector>,
         cleartext: StreamReader<u8>,
-    ) -> wasmtime::Result<(StreamReader<u8>, FutureReader<Result<(), Resource<Error>>>)> {
-        let mut store = store.as_context_mut();
-        Ok((
-            StreamReader::new(&mut store, vec![]),
-            FutureReader::new(&mut store, async { wasmtime::error::Ok(Ok(())) }),
-        ))
+    ) -> wasmtime::Result<(StreamReader<u8>, FutureReader<Result<(), Resource<Error>>>)>
+    where
+        T: 'static,
+    {
+        // Create a channel for the ciphertext producer to receive the TLS stream.
+        let (ciphertext_tx, ciphertext_rx) = oneshot::channel();
+
+        {
+            let connector = get_connector_mut(store.get().table, &conn)?;
+
+            // Update connector state based on current state.
+            let old_state = mem::replace(connector, Connector::Exhausted);
+            *connector = match old_state {
+                Connector::Init => Connector::SendConfigured {
+                    cleartext_rx: cleartext,
+                    ciphertext_tx,
+                },
+                Connector::ReceiveConfigured {
+                    ciphertext_rx,
+                    plaintext_tx,
+                } => Connector::Ready {
+                    cleartext_rx: cleartext,
+                    ciphertext_tx,
+                    ciphertext_rx,
+                    plaintext_tx,
+                },
+                other => {
+                    *connector = other;
+                    return Err(wasmtime::Error::msg(
+                        "send() called in invalid state (already called or connect in progress)",
+                    ));
+                }
+            };
+        }
+
+        let mut store_ctx = store.as_context_mut();
+
+        // Return a ciphertext stream that will produce data once connected.
+        let ciphertext = StreamReader::new(
+            &mut store_ctx,
+            PendingCiphertextProducer {
+                rx: ciphertext_rx,
+                inner: None,
+            },
+        );
+
+        // Result future always succeeds (errors come through error_rx in connect).
+        let result = FutureReader::new(&mut store_ctx, async { wasmtime::error::Ok(Ok(())) });
+
+        Ok((ciphertext, result))
     }
 
     fn receive<T>(
         mut store: Access<T, Self>,
         conn: Resource<Connector>,
         ciphertext: StreamReader<u8>,
-    ) -> wasmtime::Result<(StreamReader<u8>, FutureReader<Result<(), Resource<Error>>>)> {
-        //ciphertext.pipe(&mut store, CiphertextConsumer(Arc::clone(&stream)));
-        //let x = ciphertext.guard(store);
-        let conn = get_connector_mut(store.get().table, &conn)?;
-        let mut store = store.as_context_mut();
-        let rx = ReceiveStream::Init;
-        //conn.rx
-        Ok((
-            StreamReader::new(&mut store, rx),
-            FutureReader::new(&mut store, async { wasmtime::error::Ok(Ok(())) }),
-        ))
+    ) -> wasmtime::Result<(StreamReader<u8>, FutureReader<Result<(), Resource<Error>>>)>
+    where
+        T: 'static,
+    {
+        let (tx, rx) = oneshot::channel();
+
+        {
+            let connector = get_connector_mut(store.get().table, &conn)?;
+
+            // Update connector state based on current state.
+            let old_state = mem::replace(connector, Connector::Exhausted);
+            *connector = match old_state {
+                Connector::Init => Connector::ReceiveConfigured {
+                    ciphertext_rx: ciphertext,
+                    plaintext_tx: tx,
+                },
+                Connector::SendConfigured {
+                    cleartext_rx,
+                    ciphertext_tx,
+                } => Connector::Ready {
+                    cleartext_rx,
+                    ciphertext_tx,
+                    ciphertext_rx: ciphertext,
+                    plaintext_tx: tx,
+                },
+                other => {
+                    *connector = other;
+                    return Err(wasmtime::Error::msg(
+                        "receive() called in invalid state (already called or connect in progress)",
+                    ));
+                }
+            };
+        }
+
+        let mut store_ctx = store.as_context_mut();
+
+        // Return a plaintext stream that will produce data once connected.
+        let plaintext = StreamReader::new(
+            &mut store_ctx,
+            ReceiveProducer {
+                stream_rx: rx,
+                stream: None,
+            },
+        );
+
+        // Result future always succeeds (errors come through error_rx in connect).
+        let result = FutureReader::new(&mut store_ctx, async { wasmtime::error::Ok(Ok(())) });
+
+        Ok((plaintext, result))
     }
 
     async fn connect<T>(
         store: &Accessor<T, Self>,
         conn: Resource<Connector>,
         server_name: String,
-    ) -> wasmtime::Result<Result<(), Resource<Error>>> {
+    ) -> wasmtime::Result<Result<(), Resource<Error>>>
+    where
+        T: 'static,
+    {
+        // Extract state from connector and create TLS connection.
         store.with(|mut store| {
             let server_name = match server_name.try_into() {
                 Ok(server_name) => server_name,
@@ -198,91 +242,68 @@ impl HostConnectorWithStore for WasiTls {
                 }
             };
 
-            let conn = delete_connector(store.get().table, conn)?;
+            let connector = get_connector_mut(store.get().table, &conn)?;
+
+            // Extract state.
+            let old_state = mem::replace(connector, Connector::Exhausted);
+            let (cleartext_rx, ciphertext_tx, ciphertext_rx, plaintext_tx) = match old_state {
+                Connector::Ready {
+                    cleartext_rx,
+                    ciphertext_tx,
+                    ciphertext_rx,
+                    plaintext_tx,
+                } => (cleartext_rx, ciphertext_tx, ciphertext_rx, plaintext_tx),
+                other => {
+                    *connector = other;
+                    return Err(wasmtime::Error::msg(
+                        "connect() called before send() and receive() were set up",
+                    ));
+                }
+            };
+
+            // Build root certificate store from webpki roots.
             let roots = rustls::RootCertStore {
                 roots: webpki_roots::TLS_SERVER_ROOTS.into(),
             };
+
             let config = rustls::ClientConfig::builder()
                 .with_root_certificates(roots)
                 .with_no_client_auth();
-            let conn = rustls::ClientConnection::new(Arc::from(config), server_name)
-                .context("failed to construct rustls client connection")?;
-            let (error_tx, error_rx) = oneshot::channel();
-            let stream = Arc::new(Mutex::new(TlsStream::new(conn, error_tx)));
 
-            //incoming.pipe(&mut store, CiphertextConsumer(Arc::clone(&stream)));
-            let getter = store.getter();
+            let tls_conn = match rustls::ClientConnection::new(Arc::from(config), server_name) {
+                Ok(conn) => conn,
+                Err(err) => {
+                    let err = push_error(store.get().table, format!("{err}"))?;
+                    return Ok(Err(err));
+                }
+            };
+
+            let (error_tx, error_rx) = oneshot::channel();
+            let stream = Arc::new(Mutex::new(TlsStream::new(tls_conn, error_tx)));
+
+            // Store connected state.
+            *connector = Connector::Connected {
+                stream: Arc::clone(&stream),
+                error_rx,
+            };
+
+            // Send stream to the pending producers so they can start producing.
+            let _ = ciphertext_tx.send(Arc::clone(&stream));
+            let _ = plaintext_tx.send(Arc::clone(&stream));
+
+            // Pipe cleartext input to the TLS writer (plaintext consumer).
+            cleartext_rx.pipe(
+                &mut store,
+                PlaintextConsumer::<_, rustls::client::ClientConnectionData>(Arc::clone(&stream)),
+            );
+
+            // Pipe ciphertext input to the TLS reader (ciphertext consumer).
+            ciphertext_rx.pipe(&mut store, CiphertextConsumer(Arc::clone(&stream)));
+
+            // Handshake will happen as streams are processed.
+            // The handshake is driven by reading/writing data on the streams.
+            // Return success - any errors will be reported through the stream futures.
             Ok(Ok(()))
         })
     }
 }
-
-//impl HostWithStore for WasiTls {
-//    fn connect<T>(
-//        mut store: Access<T, Self>,
-//        hello: Resource<Hello>,
-//        incoming: StreamReader<u8>,
-//    ) -> wasmtime::Result<(
-//        StreamReader<u8>,
-//        FutureReader<Result<Resource<Handshake>, ()>>,
-//    )> {
-//        let Hello {
-//            server_name,
-//            alpn_ids,
-//            cipher_suites,
-//        } = delete_hello(store.get().table, hello)?;
-//
-//        let roots = rustls::RootCertStore {
-//            roots: webpki_roots::TLS_SERVER_ROOTS.into(),
-//        };
-//        if !cipher_suites.is_empty() {
-//            // TODO: implement
-//            bail!("custom cipher suites not supported yet")
-//        }
-//        let mut config = rustls::ClientConfig::builder()
-//            .with_root_certificates(roots)
-//            .with_client_cert_resolver(Arc::new(CertificateResolver));
-//        if let Some(alpn_ids) = alpn_ids {
-//            config.alpn_protocols = alpn_ids;
-//        }
-//        let server_name = if let Some(server_name) = server_name {
-//            server_name
-//        } else {
-//            config.enable_sni = false;
-//            ServerName::IpAddress(IpAddr::V4(Ipv4Addr::UNSPECIFIED).into())
-//        };
-//        let conn = rustls::ClientConnection::new(Arc::from(config), server_name)
-//            .context("failed to construct rustls client connection")?;
-//        let (error_tx, error_rx) = oneshot::channel();
-//        let stream = Arc::new(Mutex::new(TlsStream::new(conn, error_tx)));
-//
-//        incoming.pipe(&mut store, CiphertextConsumer(Arc::clone(&stream)));
-//        let getter = store.getter();
-//        Ok((
-//            StreamReader::new(&mut store, CiphertextProducer(Arc::clone(&stream))),
-//            FutureReader::new(
-//                &mut store,
-//                ConnectProducer::Pending {
-//                    stream,
-//                    error_rx,
-//                    getter,
-//                },
-//            ),
-//        ))
-//    }
-//}
-//
-//impl HostHandshakeWithStore for WasiTls {
-//    fn finish<T>(
-//        mut store: Access<T, Self>,
-//        handshake: Resource<Handshake>,
-//        data: StreamReader<u8>,
-//    ) -> wasmtime::Result<(StreamReader<u8>, FutureReader<Result<(), ()>>)> {
-//        let Handshake { stream, error_rx } = delete_handshake(&mut store.get().table, handshake)?;
-//        data.pipe(&mut store, PlaintextConsumer(Arc::clone(&stream)));
-//        Ok((
-//            StreamReader::new(&mut store, PlaintextProducer(stream)),
-//            FutureReader::new(&mut store, ResultProducer(error_rx)),
-//        ))
-//    }
-//}

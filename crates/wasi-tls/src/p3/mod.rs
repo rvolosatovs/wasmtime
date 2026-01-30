@@ -107,11 +107,55 @@ where
     Ok(())
 }
 
-/// Conn
-#[derive(Default)]
-pub struct Connector {
-    cleartext: Option<StreamReader<u8>>,
-    ciphertext: Option<StreamReader<u8>>,
+/// TLS client connector state.
+///
+/// This type is implementation-internal and should not be used directly.
+#[doc(hidden)]
+#[allow(private_interfaces)]
+pub enum Connector {
+    /// Initial state, waiting for send/receive setup.
+    Init,
+    /// Send stream has been set up, waiting for receive.
+    SendConfigured {
+        /// Incoming cleartext from application.
+        cleartext_rx: StreamReader<u8>,
+        /// Outgoing ciphertext producer channel.
+        ciphertext_tx: oneshot::Sender<TlsStreamClientArc>,
+    },
+    /// Receive stream has been set up, waiting for send.
+    ReceiveConfigured {
+        /// Incoming ciphertext from network.
+        ciphertext_rx: StreamReader<u8>,
+        /// Outgoing plaintext producer channel.
+        plaintext_tx: oneshot::Sender<TlsStreamClientArc>,
+    },
+    /// Both streams configured, ready for connect.
+    Ready {
+        /// Incoming cleartext from application.
+        cleartext_rx: StreamReader<u8>,
+        /// Outgoing ciphertext producer channel.
+        ciphertext_tx: oneshot::Sender<TlsStreamClientArc>,
+        /// Incoming ciphertext from network.
+        ciphertext_rx: StreamReader<u8>,
+        /// Outgoing plaintext producer channel.
+        plaintext_tx: oneshot::Sender<TlsStreamClientArc>,
+    },
+    /// Connected state, TLS handshake in progress or complete.
+    Connected {
+        /// TLS stream.
+        stream: TlsStreamClientArc,
+        /// Error receiver.
+        error_rx: oneshot::Receiver<rustls::Error>,
+    },
+    /// State has been consumed.
+    Exhausted,
+}
+
+impl Default for Connector {
+    #[inline]
+    fn default() -> Self {
+        Self::Init
+    }
 }
 
 /// Client hello
@@ -144,12 +188,14 @@ type TlsStreamClientArc = TlsStreamArc<rustls::ClientConnection>;
 type TlsStreamServerArc = TlsStreamArc<rustls::ServerConnection>;
 
 /// Client handshake
+#[allow(dead_code)]
 pub struct ClientHandshake {
     stream: TlsStreamClientArc,
     error_rx: oneshot::Receiver<rustls::Error>,
 }
 
 /// Server handshake
+#[allow(dead_code)]
 pub struct ServerHandshake {
     accepted: rustls::server::Accepted,
     consumer_tx: oneshot::Sender<TlsStreamServerArc>,
