@@ -12,12 +12,17 @@ pub mod bindings;
 mod host;
 
 use core::task::Waker;
+
 use std::sync::{Arc, Mutex};
 
 use bindings::tls::{client, types};
 use rustls::pki_types::ServerName;
 use tokio::sync::oneshot;
 use wasmtime::component::{HasData, Linker, ResourceTable, StreamReader};
+
+use crate::p3::host::{
+    CiphertextConsumer, CiphertextProducer, PlaintextConsumer, PlaintextProducer,
+};
 
 /// The type for which this crate implements the `wasi:tls` interfaces.
 pub struct WasiTls;
@@ -108,54 +113,20 @@ where
 }
 
 /// TLS client connector state.
-///
-/// This type is implementation-internal and should not be used directly.
 #[doc(hidden)]
+#[derive(Default)]
 #[allow(private_interfaces)]
-pub enum Connector {
-    /// Initial state, waiting for send/receive setup.
-    Init,
-    /// Send stream has been set up, waiting for receive.
-    SendConfigured {
-        /// Incoming cleartext from application.
-        cleartext_rx: StreamReader<u8>,
-        /// Outgoing ciphertext producer channel.
-        ciphertext_tx: oneshot::Sender<TlsStreamClientArc>,
-    },
-    /// Receive stream has been set up, waiting for send.
-    ReceiveConfigured {
-        /// Incoming ciphertext from network.
-        ciphertext_rx: StreamReader<u8>,
-        /// Outgoing plaintext producer channel.
-        plaintext_tx: oneshot::Sender<TlsStreamClientArc>,
-    },
-    /// Both streams configured, ready for connect.
-    Ready {
-        /// Incoming cleartext from application.
-        cleartext_rx: StreamReader<u8>,
-        /// Outgoing ciphertext producer channel.
-        ciphertext_tx: oneshot::Sender<TlsStreamClientArc>,
-        /// Incoming ciphertext from network.
-        ciphertext_rx: StreamReader<u8>,
-        /// Outgoing plaintext producer channel.
-        plaintext_tx: oneshot::Sender<TlsStreamClientArc>,
-    },
-    /// Connected state, TLS handshake in progress or complete.
-    Connected {
-        /// TLS stream.
-        stream: TlsStreamClientArc,
-        /// Error receiver.
-        error_rx: oneshot::Receiver<rustls::Error>,
-    },
-    /// State has been consumed.
-    Exhausted,
-}
-
-impl Default for Connector {
-    #[inline]
-    fn default() -> Self {
-        Self::Init
-    }
+pub struct Connector {
+    pub(crate) receive_tx: Option<(
+        oneshot::Sender<PlaintextProducer<rustls::ClientConnection>>,
+        oneshot::Sender<CiphertextConsumer<rustls::ClientConnection>>,
+    )>,
+    pub(crate) send_tx: Option<(
+        oneshot::Sender<CiphertextProducer<rustls::ClientConnection>>,
+        oneshot::Sender<
+            PlaintextConsumer<rustls::ClientConnection, rustls::client::ClientConnectionData>,
+        >,
+    )>,
 }
 
 /// Client hello

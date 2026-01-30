@@ -90,7 +90,7 @@ macro_rules! mk_delete {
 
 pub(crate) use {mk_delete, mk_get, mk_get_mut, mk_push};
 
-struct CiphertextConsumer<T>(TlsStreamArc<T>);
+pub struct CiphertextConsumer<T>(TlsStreamArc<T>);
 
 impl<T, U, D> StreamConsumer<D> for CiphertextConsumer<T>
 where
@@ -165,7 +165,7 @@ where
     }
 }
 
-struct PlaintextProducer<T>(TlsStreamArc<T>);
+pub struct PlaintextProducer<T>(TlsStreamArc<T>);
 
 impl<T> Clone for PlaintextProducer<T> {
     fn clone(&self) -> Self {
@@ -225,7 +225,7 @@ where
     }
 }
 
-struct PlaintextConsumer<T, U>(TlsStreamArc<T>)
+pub struct PlaintextConsumer<T, U>(TlsStreamArc<T>)
 where
     T: DerefMut<Target = rustls::ConnectionCommon<U>> + Send + 'static;
 
@@ -296,7 +296,7 @@ where
     }
 }
 
-struct CiphertextProducer<T>(TlsStreamArc<T>);
+pub struct CiphertextProducer<T>(TlsStreamArc<T>);
 
 impl<T, U, D> StreamProducer<D> for CiphertextProducer<T>
 where
@@ -351,7 +351,7 @@ where
     }
 }
 
-struct ResultProducer(oneshot::Receiver<rustls::Error>);
+pub struct ResultProducer(oneshot::Receiver<rustls::Error>);
 
 impl<D> FutureProducer<D> for ResultProducer {
     type Item = Result<(), ()>;

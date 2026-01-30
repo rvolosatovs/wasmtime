@@ -7,37 +7,34 @@ use super::{
 use crate::p3::bindings::tls::client::{Connector, Host, HostConnector, HostConnectorWithStore};
 use crate::p3::bindings::tls::types::Error;
 use crate::p3::{TlsStream, TlsStreamClientArc, WasiTls, WasiTlsCtxView};
-use core::mem;
 use core::pin::Pin;
 use core::task::{Context, Poll};
 use std::sync::{Arc, Mutex};
 use tokio::sync::oneshot;
-use wasmtime::AsContextMut as _;
-use wasmtime::StoreContextMut;
 use wasmtime::component::{
-    Access, Accessor, Destination, FutureReader, Resource, StreamProducer, StreamReader,
+    Access, Accessor, Destination, FutureReader, Resource, Source, StreamProducer, StreamReader,
     StreamResult,
 };
+use wasmtime::{StoreContextMut, component::StreamConsumer};
 
 mk_push!(Error, push_error, "error");
-
 mk_push!(Connector, push_connector, "client connector");
 mk_get_mut!(Connector, get_connector_mut, "client connector");
 mk_delete!(Connector, delete_connector, "client connector");
 
 type PlaintextProducerClient = PlaintextProducer<rustls::ClientConnection>;
 
-struct ReceiveProducer {
-    stream_rx: oneshot::Receiver<TlsStreamClientArc>,
-    stream: Option<PlaintextProducer<rustls::ClientConnection>>,
+struct Pending<T> {
+    inner_rx: oneshot::Receiver<T>,
+    inner: Option<T>,
 }
 
-impl<D> StreamProducer<D> for ReceiveProducer
+impl<T, D> StreamProducer<D> for Pending<T>
 where
-    D: 'static,
+    T: StreamProducer<D> + Unpin,
 {
-    type Item = <PlaintextProducerClient as StreamProducer<D>>::Item;
-    type Buffer = <PlaintextProducerClient as StreamProducer<D>>::Buffer;
+    type Item = <T as StreamProducer<D>>::Item;
+    type Buffer = <T as StreamProducer<D>>::Buffer;
 
     fn poll_produce<'a>(
         mut self: Pin<&mut Self>,
@@ -46,12 +43,12 @@ where
         dst: Destination<'a, Self::Item, Self::Buffer>,
         finish: bool,
     ) -> Poll<wasmtime::Result<StreamResult>> {
-        if let Some(ref mut stream) = self.stream {
-            return Pin::new(stream).poll_produce(cx, store, dst, finish);
+        if let Some(ref mut inner) = self.inner {
+            return Pin::new(inner).poll_produce(cx, store, dst, finish);
         }
-        match Pin::new(&mut self.stream_rx).poll(cx) {
-            Poll::Ready(Ok(stream)) => {
-                self.stream = Some(PlaintextProducer(stream));
+        match Pin::new(&mut self.inner_rx).poll(cx) {
+            Poll::Ready(Ok(inner)) => {
+                self.inner = Some(inner);
                 return self.poll_produce(cx, store, dst, finish);
             }
             Poll::Ready(Err(..)) => Poll::Ready(Ok(StreamResult::Dropped)),
@@ -61,12 +58,40 @@ where
     }
 }
 
-struct PendingCiphertextProducer {
-    rx: oneshot::Receiver<TlsStreamClientArc>,
-    inner: Option<CiphertextProducer<rustls::ClientConnection>>,
+impl<T, D> StreamConsumer<D> for Pending<T>
+where
+    T: StreamConsumer<D> + Unpin,
+{
+    type Item = <T as StreamConsumer<D>>::Item;
+
+    fn poll_consume(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        store: StoreContextMut<D>,
+        src: Source<Self::Item>,
+        finish: bool,
+    ) -> Poll<wasmtime::Result<StreamResult>> {
+        if let Some(ref mut inner) = self.inner {
+            return Pin::new(inner).poll_consume(cx, store, src, finish);
+        }
+        match Pin::new(&mut self.inner_rx).poll(cx) {
+            Poll::Ready(Ok(inner)) => {
+                self.inner = Some(inner);
+                return self.poll_consume(cx, store, src, finish);
+            }
+            Poll::Ready(Err(..)) => Poll::Ready(Ok(StreamResult::Dropped)),
+            Poll::Pending if finish => Poll::Ready(Ok(StreamResult::Cancelled)),
+            Poll::Pending => Poll::Pending,
+        }
+    }
 }
 
-impl<D> StreamProducer<D> for PendingCiphertextProducer
+struct SendProducer {
+    rx: oneshot::Receiver<TlsStreamClientArc>,
+    stream: Option<CiphertextProducer<rustls::ClientConnection>>,
+}
+
+impl<D> StreamProducer<D> for SendProducer
 where
     D: 'static,
 {
@@ -80,19 +105,15 @@ where
         dst: Destination<'a, Self::Item, Self::Buffer>,
         finish: bool,
     ) -> Poll<wasmtime::Result<StreamResult>> {
-        // If we already have the inner producer, delegate to it.
-        if let Some(ref mut inner) = self.inner {
+        if let Some(ref mut inner) = self.stream {
             return Pin::new(inner).poll_produce(cx, store, dst, finish);
         }
-
-        // Try to receive the stream.
         match Pin::new(&mut self.rx).poll(cx) {
             Poll::Ready(Ok(stream)) => {
-                self.inner = Some(CiphertextProducer(stream));
-                // Now poll the inner producer.
-                Pin::new(self.inner.as_mut().unwrap()).poll_produce(cx, store, dst, finish)
+                self.stream = Some(CiphertextProducer(stream));
+                Pin::new(self.stream.as_mut().unwrap()).poll_produce(cx, store, dst, finish)
             }
-            Poll::Ready(Err(_)) => Poll::Ready(Ok(StreamResult::Dropped)),
+            Poll::Ready(Err(..)) => Poll::Ready(Ok(StreamResult::Dropped)),
             Poll::Pending if finish => Poll::Ready(Ok(StreamResult::Cancelled)),
             Poll::Pending => Poll::Pending,
         }
@@ -121,52 +142,21 @@ impl HostConnectorWithStore for WasiTls {
     where
         T: 'static,
     {
-        // Create a channel for the ciphertext producer to receive the TLS stream.
-        let (ciphertext_tx, ciphertext_rx) = oneshot::channel();
+        //let (tx, rx) = oneshot::channel();
 
-        {
-            let connector = get_connector_mut(store.get().table, &conn)?;
+        todo!()
 
-            // Update connector state based on current state.
-            let old_state = mem::replace(connector, Connector::Exhausted);
-            *connector = match old_state {
-                Connector::Init => Connector::SendConfigured {
-                    cleartext_rx: cleartext,
-                    ciphertext_tx,
-                },
-                Connector::ReceiveConfigured {
-                    ciphertext_rx,
-                    plaintext_tx,
-                } => Connector::Ready {
-                    cleartext_rx: cleartext,
-                    ciphertext_tx,
-                    ciphertext_rx,
-                    plaintext_tx,
-                },
-                other => {
-                    *connector = other;
-                    return Err(wasmtime::Error::msg(
-                        "send() called in invalid state (already called or connect in progress)",
-                    ));
-                }
-            };
-        }
+        //let connector = get_connector_mut(store.get().table, &conn)?;
+        //if connector.receive_tx.is_some() {
+        //    return Err(wasmtime::Error::msg("send() already called"));
+        //}
+        //connector.cleartext_rx = Some(cleartext);
+        //connector.receive_tx = Some(tx);
 
-        let mut store_ctx = store.as_context_mut();
-
-        // Return a ciphertext stream that will produce data once connected.
-        let ciphertext = StreamReader::new(
-            &mut store_ctx,
-            PendingCiphertextProducer {
-                rx: ciphertext_rx,
-                inner: None,
-            },
-        );
-
-        // Result future always succeeds (errors come through error_rx in connect).
-        let result = FutureReader::new(&mut store_ctx, async { wasmtime::error::Ok(Ok(())) });
-
-        Ok((ciphertext, result))
+        //let mut ctx = store.as_context_mut();
+        //let ciphertext = StreamReader::new(&mut ctx, SendProducer { rx, stream: None });
+        //let result = FutureReader::new(&mut ctx, async { wasmtime::error::Ok(Ok(())) });
+        //Ok((ciphertext, result))
     }
 
     fn receive<T>(
@@ -177,51 +167,35 @@ impl HostConnectorWithStore for WasiTls {
     where
         T: 'static,
     {
-        let (tx, rx) = oneshot::channel();
+        let (cons_tx, cons_rx) = oneshot::channel();
+        let (prod_tx, prod_rx) = oneshot::channel();
 
-        {
-            let connector = get_connector_mut(store.get().table, &conn)?;
+        let conn @ Connector {
+            receive_tx: None, ..
+        } = get_connector_mut(store.get().table, &conn)?
+        else {
+            return Err(wasmtime::Error::msg("`receive` already called"));
+        };
+        conn.receive_tx = Some((prod_tx, cons_tx));
 
-            // Update connector state based on current state.
-            let old_state = mem::replace(connector, Connector::Exhausted);
-            *connector = match old_state {
-                Connector::Init => Connector::ReceiveConfigured {
-                    ciphertext_rx: ciphertext,
-                    plaintext_tx: tx,
-                },
-                Connector::SendConfigured {
-                    cleartext_rx,
-                    ciphertext_tx,
-                } => Connector::Ready {
-                    cleartext_rx,
-                    ciphertext_tx,
-                    ciphertext_rx: ciphertext,
-                    plaintext_tx: tx,
-                },
-                other => {
-                    *connector = other;
-                    return Err(wasmtime::Error::msg(
-                        "receive() called in invalid state (already called or connect in progress)",
-                    ));
-                }
-            };
-        }
-
-        let mut store_ctx = store.as_context_mut();
-
-        // Return a plaintext stream that will produce data once connected.
-        let plaintext = StreamReader::new(
-            &mut store_ctx,
-            ReceiveProducer {
-                stream_rx: rx,
-                stream: None,
+        let rx = StreamReader::new(
+            &mut store,
+            Pending {
+                inner_rx: prod_rx,
+                inner: None,
             },
         );
-
-        // Result future always succeeds (errors come through error_rx in connect).
-        let result = FutureReader::new(&mut store_ctx, async { wasmtime::error::Ok(Ok(())) });
-
-        Ok((plaintext, result))
+        ciphertext.pipe(
+            &mut store,
+            Pending {
+                inner_rx: cons_rx,
+                inner: None,
+            },
+        );
+        Ok((
+            rx,
+            FutureReader::new(&mut store, async { wasmtime::error::Ok(Ok(())) }),
+        ))
     }
 
     async fn connect<T>(
@@ -232,10 +206,9 @@ impl HostConnectorWithStore for WasiTls {
     where
         T: 'static,
     {
-        // Extract state from connector and create TLS connection.
         store.with(|mut store| {
             let server_name = match server_name.try_into() {
-                Ok(server_name) => server_name,
+                Ok(name) => name,
                 Err(err) => {
                     let err = push_error(store.get().table, format!("{err}"))?;
                     return Ok(Err(err));
@@ -243,29 +216,20 @@ impl HostConnectorWithStore for WasiTls {
             };
 
             let connector = get_connector_mut(store.get().table, &conn)?;
+            let cleartext_rx = connector
+                .cleartext_rx
+                .take()
+                .ok_or_else(|| wasmtime::Error::msg("send() not called before connect()"))?;
+            let ciphertext_rx = connector
+                .ciphertext_rx
+                .take()
+                .ok_or_else(|| wasmtime::Error::msg("receive() not called before connect()"))?;
+            let ciphertext_tx = connector.receive_tx.take().unwrap();
+            let plaintext_tx = connector.send_tx.take().unwrap();
 
-            // Extract state.
-            let old_state = mem::replace(connector, Connector::Exhausted);
-            let (cleartext_rx, ciphertext_tx, ciphertext_rx, plaintext_tx) = match old_state {
-                Connector::Ready {
-                    cleartext_rx,
-                    ciphertext_tx,
-                    ciphertext_rx,
-                    plaintext_tx,
-                } => (cleartext_rx, ciphertext_tx, ciphertext_rx, plaintext_tx),
-                other => {
-                    *connector = other;
-                    return Err(wasmtime::Error::msg(
-                        "connect() called before send() and receive() were set up",
-                    ));
-                }
-            };
-
-            // Build root certificate store from webpki roots.
             let roots = rustls::RootCertStore {
                 roots: webpki_roots::TLS_SERVER_ROOTS.into(),
             };
-
             let config = rustls::ClientConfig::builder()
                 .with_root_certificates(roots)
                 .with_no_client_auth();
@@ -278,31 +242,18 @@ impl HostConnectorWithStore for WasiTls {
                 }
             };
 
-            let (error_tx, error_rx) = oneshot::channel();
+            let (error_tx, _error_rx) = oneshot::channel();
             let stream = Arc::new(Mutex::new(TlsStream::new(tls_conn, error_tx)));
 
-            // Store connected state.
-            *connector = Connector::Connected {
-                stream: Arc::clone(&stream),
-                error_rx,
-            };
-
-            // Send stream to the pending producers so they can start producing.
             let _ = ciphertext_tx.send(Arc::clone(&stream));
             let _ = plaintext_tx.send(Arc::clone(&stream));
 
-            // Pipe cleartext input to the TLS writer (plaintext consumer).
             cleartext_rx.pipe(
                 &mut store,
                 PlaintextConsumer::<_, rustls::client::ClientConnectionData>(Arc::clone(&stream)),
             );
-
-            // Pipe ciphertext input to the TLS reader (ciphertext consumer).
             ciphertext_rx.pipe(&mut store, CiphertextConsumer(Arc::clone(&stream)));
 
-            // Handshake will happen as streams are processed.
-            // The handshake is driven by reading/writing data on the streams.
-            // Return success - any errors will be reported through the stream futures.
             Ok(Ok(()))
         })
     }
