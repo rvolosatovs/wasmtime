@@ -2,7 +2,10 @@ use crate::p3::{TlsStream, TlsStreamArc};
 use core::ops::DerefMut;
 use core::pin::Pin;
 use core::task::{Context, Poll, Waker};
-use std::io::{Read as _, Write as _};
+use std::{
+    io::{Read as _, Write as _},
+    sync::Arc,
+};
 use tokio::sync::oneshot;
 use wasmtime::StoreContextMut;
 use wasmtime::component::{
@@ -163,6 +166,12 @@ where
 }
 
 struct PlaintextProducer<T>(TlsStreamArc<T>);
+
+impl<T> Clone for PlaintextProducer<T> {
+    fn clone(&self) -> Self {
+        Self(Arc::clone(&self.0))
+    }
+}
 
 impl<T, U, D> StreamProducer<D> for PlaintextProducer<T>
 where

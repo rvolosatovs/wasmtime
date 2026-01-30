@@ -44,7 +44,6 @@ async fn run_test(path: &str) -> Result<()> {
     };
 
     let engine = test_programs_artifacts::engine(|config| {
-        config.async_support(true);
         config.wasm_component_model_async(true);
     });
     let mut store = Store::new(&engine, ctx);

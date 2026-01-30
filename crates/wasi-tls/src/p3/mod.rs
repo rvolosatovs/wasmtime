@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex};
 use bindings::tls::{client, types};
 use rustls::pki_types::ServerName;
 use tokio::sync::oneshot;
-use wasmtime::component::{HasData, Linker, ResourceTable};
+use wasmtime::component::{HasData, Linker, ResourceTable, StreamReader};
 
 /// The type for which this crate implements the `wasi:tls` interfaces.
 pub struct WasiTls;
@@ -109,7 +109,10 @@ where
 
 /// Conn
 #[derive(Default)]
-pub struct Connector;
+pub struct Connector {
+    cleartext: Option<StreamReader<u8>>,
+    ciphertext: Option<StreamReader<u8>>,
+}
 
 /// Client hello
 #[derive(Clone, Default, Eq, PartialEq, Hash)]

@@ -2,30 +2,61 @@ use super::{
     CiphertextConsumer, CiphertextProducer, PlaintextConsumer, PlaintextProducer, ResultProducer,
     mk_delete, mk_get, mk_get_mut, mk_push,
 };
-use crate::p3::bindings::tls::client::{
-    Connector, Host, HostConnector, HostConnectorWithStore, HostWithStore,
-};
+use crate::p3::bindings::tls::client::{Connector, Host, HostConnector, HostConnectorWithStore};
 use crate::p3::bindings::tls::types::Error;
 use crate::p3::{TlsStream, TlsStreamClientArc, WasiTls, WasiTlsCtxView};
-use core::mem;
 use core::net::{IpAddr, Ipv4Addr};
 use core::pin::{Pin, pin};
 use core::task::{Context, Poll};
+use core::{mem, task::Waker};
 use rustls::client::ResolvesClientCert;
 use rustls::pki_types::ServerName;
 use std::sync::{Arc, Mutex};
-use tokio::sync::oneshot;
-use wasmtime::error::Context as _;
-use wasmtime::{
-    AsContextMut as _,
-    component::{Access, Accessor, FutureProducer, FutureReader, Resource, StreamReader},
+use tokio::sync::{SetOnce, oneshot};
+use wasmtime::AsContextMut as _;
+use wasmtime::StoreContextMut;
+use wasmtime::component::{
+    Access, Accessor, Destination, FutureProducer, FutureReader, Resource, StreamProducer,
+    StreamReader, StreamResult,
 };
-use wasmtime::{StoreContextMut, bail, format_err};
+use wasmtime::error::Context as _;
 
 mk_push!(Error, push_error, "error");
+
 mk_push!(Connector, push_connector, "client connector");
 mk_get!(Connector, get_connector, "client connector");
+mk_get_mut!(Connector, get_connector_mut, "client connector");
 mk_delete!(Connector, delete_connector, "client connector");
+
+type PlaintextProducerClient = PlaintextProducer<rustls::ClientConnection>;
+
+#[derive(Clone)]
+enum ReceiveStream {
+    Init,
+    Pending(Waker),
+    Active(PlaintextProducerClient),
+}
+
+impl<D> StreamProducer<D> for ReceiveStream {
+    type Item = <PlaintextProducerClient as StreamProducer<D>>::Item;
+    type Buffer = <PlaintextProducerClient as StreamProducer<D>>::Buffer;
+
+    fn poll_produce<'a>(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        store: StoreContextMut<'a, D>,
+        dst: Destination<'a, Self::Item, Self::Buffer>,
+        finish: bool,
+    ) -> Poll<wasmtime::Result<StreamResult>> {
+        match &mut *self {
+            Self::Init | Self::Pending(..) => {
+                *self = Self::Pending(cx.waker().clone());
+                Poll::Pending
+            }
+            Self::Active(stream) => Pin::new(stream).poll_produce(cx, store, dst, finish),
+        }
+    }
+}
 
 //#[derive(Default)]
 //enum ConnectProducer<T> {
@@ -117,40 +148,6 @@ impl HostConnector for WasiTlsCtxView<'_> {
         push_connector(&mut self.table, Connector::default())
     }
 
-    //    fn set_server_name(
-    //        &mut self,
-    //        hello: Resource<Hello>,
-    //        server_name: String,
-    //    ) -> wasmtime::Result<Result<(), ()>> {
-    //        let hello = get_hello_mut(&mut self.table, &hello)?;
-    //        let Ok(server_name) = server_name.try_into() else {
-    //            return Ok(Err(()));
-    //        };
-    //        hello.server_name = Some(server_name);
-    //        Ok(Ok(()))
-    //    }
-    //
-    //    fn set_alpn_ids(
-    //        &mut self,
-    //        hello: Resource<Hello>,
-    //        alpn_ids: Vec<Vec<u8>>,
-    //    ) -> wasmtime::Result<()> {
-    //        let hello = get_hello_mut(&mut self.table, &hello)?;
-    //        hello.alpn_ids = Some(alpn_ids);
-    //        Ok(())
-    //    }
-    //
-    //    fn set_cipher_suites(
-    //        &mut self,
-    //        hello: Resource<Hello>,
-    //        cipher_suites: Vec<u16>,
-    //    ) -> wasmtime::Result<()> {
-    //        let hello = get_hello_mut(&mut self.table, &hello)?;
-    //        hello.cipher_suites = cipher_suites;
-    //        Ok(())
-    //    }
-    //
-
     fn drop(&mut self, conn: Resource<Connector>) -> wasmtime::Result<()> {
         delete_connector(&mut self.table, conn)?;
         Ok(())
@@ -176,9 +173,13 @@ impl HostConnectorWithStore for WasiTls {
         ciphertext: StreamReader<u8>,
     ) -> wasmtime::Result<(StreamReader<u8>, FutureReader<Result<(), Resource<Error>>>)> {
         //ciphertext.pipe(&mut store, CiphertextConsumer(Arc::clone(&stream)));
+        //let x = ciphertext.guard(store);
+        let conn = get_connector_mut(store.get().table, &conn)?;
         let mut store = store.as_context_mut();
+        let rx = ReceiveStream::Init;
+        //conn.rx
         Ok((
-            StreamReader::new(&mut store, vec![]),
+            StreamReader::new(&mut store, rx),
             FutureReader::new(&mut store, async { wasmtime::error::Ok(Ok(())) }),
         ))
     }
@@ -268,38 +269,6 @@ impl HostConnectorWithStore for WasiTls {
 //                },
 //            ),
 //        ))
-//    }
-//}
-//
-//impl HostHandshake for WasiTlsCtxView<'_> {
-//    fn set_client_certificate(
-//        &mut self,
-//        _handshake: Resource<Handshake>,
-//        _cert: Resource<Certificate>,
-//    ) -> wasmtime::Result<()> {
-//        todo!()
-//    }
-//
-//    fn get_server_certificate(
-//        &mut self,
-//        _handshake: Resource<Handshake>,
-//    ) -> wasmtime::Result<Option<Resource<Certificate>>> {
-//        todo!()
-//    }
-//
-//    fn get_cipher_suite(&mut self, handshake: Resource<Handshake>) -> wasmtime::Result<u16> {
-//        let Handshake { stream, .. } = get_handshake(&self.table, &handshake)?;
-//        let mut stream = stream.lock();
-//        let TlsStream { conn, .. } = stream.as_deref_mut().unwrap();
-//        let cipher_suite = conn
-//            .negotiated_cipher_suite()
-//            .context("cipher suite not available")?;
-//        Ok(cipher_suite.suite().get_u16())
-//    }
-//
-//    fn drop(&mut self, handshake: Resource<Handshake>) -> wasmtime::Result<()> {
-//        delete_handshake(&mut self.table, handshake)?;
-//        Ok(())
 //    }
 //}
 //
