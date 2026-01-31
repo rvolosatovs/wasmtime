@@ -18,8 +18,9 @@ use std::sync::{Arc, Mutex};
 use bindings::tls::{client, types};
 use rustls::pki_types::ServerName;
 use tokio::sync::oneshot;
-use wasmtime::component::{HasData, Linker, ResourceTable, StreamReader};
+use wasmtime::component::{HasData, Linker, Resource, ResourceTable, StreamReader};
 
+use crate::p3::bindings::tls::types::Error;
 use crate::p3::host::{
     CiphertextConsumer, CiphertextProducer, PlaintextConsumer, PlaintextProducer,
 };
@@ -120,12 +121,14 @@ pub struct Connector {
     pub(crate) receive_tx: Option<(
         oneshot::Sender<PlaintextProducer<rustls::ClientConnection>>,
         oneshot::Sender<CiphertextConsumer<rustls::ClientConnection>>,
+        oneshot::Sender<Resource<Error>>,
     )>,
     pub(crate) send_tx: Option<(
         oneshot::Sender<CiphertextProducer<rustls::ClientConnection>>,
         oneshot::Sender<
             PlaintextConsumer<rustls::ClientConnection, rustls::client::ClientConnectionData>,
         >,
+        oneshot::Sender<Resource<Error>>,
     )>,
 }
 

@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Skill(ms-rust)",
+      "Bash(find:*)",
+      "Bash(cat:*)",
+      "Bash(cargo check:*)"
+    ]
+  }
+}

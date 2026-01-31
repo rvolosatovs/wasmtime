@@ -1,4 +1,4 @@
-use crate::p3::{TlsStream, TlsStreamArc};
+use crate::p3::{TlsStream, TlsStreamArc, bindings::tls::client::Error};
 use core::ops::DerefMut;
 use core::pin::Pin;
 use core::task::{Context, Poll, Waker};
@@ -7,11 +7,11 @@ use std::{
     sync::Arc,
 };
 use tokio::sync::oneshot;
-use wasmtime::StoreContextMut;
 use wasmtime::component::{
     Destination, FutureProducer, Source, StreamConsumer, StreamProducer, StreamResult,
 };
 use wasmtime::error::Context as _;
+use wasmtime::{StoreContextMut, component::Resource};
 
 mod client;
 mod types;
@@ -89,6 +89,77 @@ macro_rules! mk_delete {
 }
 
 pub(crate) use {mk_delete, mk_get, mk_get_mut, mk_push};
+
+struct Pending<T> {
+    inner_rx: oneshot::Receiver<T>,
+    inner: Option<T>,
+}
+
+impl<T> From<oneshot::Receiver<T>> for Pending<T> {
+    fn from(rx: oneshot::Receiver<T>) -> Self {
+        Self {
+            inner_rx: rx,
+            inner: None,
+        }
+    }
+}
+
+impl<T, D> StreamProducer<D> for Pending<T>
+where
+    T: StreamProducer<D> + Unpin,
+{
+    type Item = <T as StreamProducer<D>>::Item;
+    type Buffer = <T as StreamProducer<D>>::Buffer;
+
+    fn poll_produce<'a>(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        store: StoreContextMut<'a, D>,
+        dst: Destination<'a, Self::Item, Self::Buffer>,
+        finish: bool,
+    ) -> Poll<wasmtime::Result<StreamResult>> {
+        if let Some(ref mut inner) = self.inner {
+            return Pin::new(inner).poll_produce(cx, store, dst, finish);
+        }
+        match Pin::new(&mut self.inner_rx).poll(cx) {
+            Poll::Ready(Ok(inner)) => {
+                self.inner = Some(inner);
+                return self.poll_produce(cx, store, dst, finish);
+            }
+            Poll::Ready(Err(..)) => Poll::Ready(Ok(StreamResult::Dropped)),
+            Poll::Pending if finish => Poll::Ready(Ok(StreamResult::Cancelled)),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl<T, D> StreamConsumer<D> for Pending<T>
+where
+    T: StreamConsumer<D> + Unpin,
+{
+    type Item = <T as StreamConsumer<D>>::Item;
+
+    fn poll_consume(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        store: StoreContextMut<D>,
+        src: Source<Self::Item>,
+        finish: bool,
+    ) -> Poll<wasmtime::Result<StreamResult>> {
+        if let Some(ref mut inner) = self.inner {
+            return Pin::new(inner).poll_consume(cx, store, src, finish);
+        }
+        match Pin::new(&mut self.inner_rx).poll(cx) {
+            Poll::Ready(Ok(inner)) => {
+                self.inner = Some(inner);
+                return self.poll_consume(cx, store, src, finish);
+            }
+            Poll::Ready(Err(..)) => Poll::Ready(Ok(StreamResult::Dropped)),
+            Poll::Pending if finish => Poll::Ready(Ok(StreamResult::Cancelled)),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
 
 pub struct CiphertextConsumer<T>(TlsStreamArc<T>);
 
@@ -351,10 +422,10 @@ where
     }
 }
 
-pub struct ResultProducer(oneshot::Receiver<rustls::Error>);
+pub struct ResultProducer(oneshot::Receiver<Resource<Error>>);
 
 impl<D> FutureProducer<D> for ResultProducer {
-    type Item = Result<(), ()>;
+    type Item = Result<(), Resource<Error>>;
 
     fn poll_produce(
         mut self: Pin<&mut Self>,
@@ -363,7 +434,7 @@ impl<D> FutureProducer<D> for ResultProducer {
         finish: bool,
     ) -> Poll<wasmtime::error::Result<Option<Self::Item>>> {
         match Pin::new(&mut self.0).poll(cx) {
-            Poll::Ready(Ok(_err)) => Poll::Ready(Ok(Some(Err(())))),
+            Poll::Ready(Ok(err)) => Poll::Ready(Ok(Some(Err(err)))),
             Poll::Ready(Err(..)) => Poll::Ready(Ok(Some(Ok(())))),
             Poll::Pending if finish => Poll::Ready(Ok(None)),
             Poll::Pending => Poll::Pending,
