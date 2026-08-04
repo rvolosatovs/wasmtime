@@ -390,6 +390,11 @@ pub enum Trampoline {
         ty: TypeStreamTableIndex,
         options: OptionsId,
     },
+    StreamForward {
+        instance: RuntimeComponentInstanceIndex,
+        ty: TypeStreamTableIndex,
+        async_: bool,
+    },
     StreamCancelRead {
         instance: RuntimeComponentInstanceIndex,
         ty: TypeStreamTableIndex,
@@ -1032,6 +1037,15 @@ impl LinearizeDfg<'_> {
                 instance: *instance,
                 ty: *ty,
                 options: self.options(*options),
+            },
+            Trampoline::StreamForward {
+                instance,
+                ty,
+                async_,
+            } => info::Trampoline::StreamForward {
+                instance: *instance,
+                ty: *ty,
+                async_: *async_,
             },
             Trampoline::StreamCancelRead {
                 instance,

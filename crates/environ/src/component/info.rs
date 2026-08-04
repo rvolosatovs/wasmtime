@@ -887,6 +887,19 @@ pub enum Trampoline {
         options: OptionsIndex,
     },
 
+    /// A `stream.forward` intrinsic to forward elements from the readable end
+    /// of one `stream` to the writable end of another `stream` of the
+    /// specified type.
+    StreamForward {
+        /// The specific component instance which is calling the intrinsic.
+        instance: RuntimeComponentInstanceIndex,
+        /// The table index for the specific `stream` type and caller instance.
+        ty: TypeStreamTableIndex,
+        /// If `false`, block until forwarding completes rather than return
+        /// `BLOCKED`.
+        async_: bool,
+    },
+
     /// A `stream.cancel-read` intrinsic to cancel an in-progress read from a
     /// `stream` of the specified type.
     StreamCancelRead {
@@ -1225,6 +1238,7 @@ impl Trampoline {
             StreamNew { .. } => format!("stream-new"),
             StreamRead { .. } => format!("stream-read"),
             StreamWrite { .. } => format!("stream-write"),
+            StreamForward { .. } => format!("stream-forward"),
             StreamCancelRead { .. } => format!("stream-cancel-read"),
             StreamCancelWrite { .. } => format!("stream-cancel-write"),
             StreamDropReadable { .. } => format!("stream-drop-readable"),

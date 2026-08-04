@@ -242,6 +242,11 @@ enum LocalInitializer<'data> {
         ty: ComponentDefinedTypeId,
         options: LocalCanonicalOptions,
     },
+    StreamForward {
+        ty: ComponentDefinedTypeId,
+        func: ModuleInternedTypeIndex,
+        async_: bool,
+    },
     StreamCancelRead {
         ty: ComponentDefinedTypeId,
         func: ModuleInternedTypeIndex,
@@ -1114,6 +1119,16 @@ impl<'a, 'data> Translator<'a, 'data> {
                             let options = self.canonical_options(&options, core_func_index)?;
                             core_func_index += 1;
                             LocalInitializer::StreamWrite { ty, options }
+                        }
+                        wasmparser::CanonicalFunction::StreamForward { ty, async_ } => {
+                            let ty = self
+                                .validator
+                                .types(0)
+                                .unwrap()
+                                .component_defined_type_at(ty);
+                            let func = self.core_func_signature(core_func_index)?;
+                            core_func_index += 1;
+                            LocalInitializer::StreamForward { ty, func, async_ }
                         }
                         wasmparser::CanonicalFunction::StreamCancelRead { ty, async_ } => {
                             let ty = self

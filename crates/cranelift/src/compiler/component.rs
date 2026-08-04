@@ -402,6 +402,22 @@ impl<'a> TrampolineCompiler<'a> {
                     );
                 }
             }
+            Trampoline::StreamForward {
+                instance,
+                ty,
+                async_,
+            } => {
+                self.translate_libcall(
+                    host::stream_forward,
+                    TrapSentinel::NegativeOne,
+                    WasmArgs::InRegisters,
+                    |me, params| {
+                        params.push(me.index_value(*instance));
+                        params.push(me.index_value(*ty));
+                        params.push(me.builder.ins().iconst(ir::types::I8, i64::from(*async_)));
+                    },
+                );
+            }
             Trampoline::StreamCancelRead {
                 instance,
                 ty,
@@ -1526,6 +1542,7 @@ impl<'a> TrampolineCompiler<'a> {
             | Trampoline::StreamNew { instance, .. }
             | Trampoline::StreamRead { instance, .. }
             | Trampoline::StreamWrite { instance, .. }
+            | Trampoline::StreamForward { instance, .. }
             | Trampoline::StreamCancelRead { instance, .. }
             | Trampoline::StreamCancelWrite { instance, .. }
             | Trampoline::StreamDropReadable { instance, .. }

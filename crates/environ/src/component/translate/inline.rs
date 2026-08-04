@@ -849,6 +849,22 @@ impl<'a> Inliner<'a> {
                 ));
                 frame.funcs.push((func, dfg::CoreDef::Trampoline(index)));
             }
+            StreamForward { ty, func, async_ } => {
+                let InterfaceType::Stream(ty) =
+                    types.defined_type(frame.translation.types_ref(), *ty)?
+                else {
+                    unreachable!()
+                };
+                let index = self.result.trampolines.push((
+                    *func,
+                    dfg::Trampoline::StreamForward {
+                        instance: frame.instance,
+                        ty,
+                        async_: *async_,
+                    },
+                ));
+                frame.funcs.push((*func, dfg::CoreDef::Trampoline(index)));
+            }
             StreamCancelRead { ty, func, async_ } => {
                 let InterfaceType::Stream(ty) =
                     types.defined_type(frame.translation.types_ref(), *ty)?

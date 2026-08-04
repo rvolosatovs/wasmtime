@@ -4237,6 +4237,17 @@ pub trait VMComponentAsyncStore {
         count: u32,
     ) -> Result<u32>;
 
+    /// The `stream.forward` intrinsic.
+    fn stream_forward(
+        &mut self,
+        instance: Instance,
+        ty: TypeStreamTableIndex,
+        async_: bool,
+        reader: u32,
+        writer: u32,
+        count: u32,
+    ) -> Result<u32>;
+
     /// The "fast-path" implementation of the `stream.write` intrinsic for
     /// "flat" (i.e. memcpy-able) payloads.
     fn flat_stream_write(
@@ -4489,6 +4500,27 @@ impl<T: 'static> VMComponentAsyncStore for StoreInner<T> {
                 None,
                 stream,
                 address,
+                count,
+            )
+            .map(|result| result.encode())
+    }
+
+    fn stream_forward(
+        &mut self,
+        instance: Instance,
+        ty: TypeStreamTableIndex,
+        async_: bool,
+        reader: u32,
+        writer: u32,
+        count: u32,
+    ) -> Result<u32> {
+        instance
+            .guest_forward(
+                StoreContextMut(self),
+                TransmitIndex::Stream(ty),
+                async_,
+                reader,
+                writer,
                 count,
             )
             .map(|result| result.encode())
