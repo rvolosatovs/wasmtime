@@ -1060,39 +1060,89 @@ pub async fn async_forward_between_host_ends_with_consumer_rejected() -> Result<
 
 /// A component whose `drive` export registers a `stream.forward` from a
 /// host-created stream and returns the destination's readable end to the
-/// host.
+/// host, and whose `finish` export collects the forward's terminal event
+/// afterwards.
 const LIFT_DST_OF_FORWARD_FROM_HOST_PRODUCER: &str = r#"
 (component
+  (core module $libc (memory (export "m") 1))
+  (core instance $libc (instantiate $libc))
+
   (type $s (stream u8))
   (core func $stream.new (canon stream.new $s))
   (core func $stream.forward (canon stream.forward $s async))
+  (core func $stream.drop-readable (canon stream.drop-readable $s))
+  (core func $stream.drop-writable (canon stream.drop-writable $s))
+  (core func $waitable-set.new (canon waitable-set.new))
+  (core func $waitable-set.wait (canon waitable-set.wait (memory (core memory $libc "m"))))
+  (core func $waitable-set.drop (canon waitable-set.drop))
+  (core func $waitable.join (canon waitable.join))
 
   (core module $m
+    (import "" "m" (memory 1))
     (import "" "stream.new" (func $stream.new (result i64)))
     (import "" "stream.forward" (func $stream.forward (param i32 i32 i32) (result i32)))
+    (import "" "stream.drop-readable" (func $stream.drop-readable (param i32)))
+    (import "" "stream.drop-writable" (func $stream.drop-writable (param i32)))
+    (import "" "waitable-set.new" (func $waitable-set.new (result i32)))
+    (import "" "waitable-set.wait" (func $waitable-set.wait (param i32 i32) (result i32)))
+    (import "" "waitable-set.drop" (func $waitable-set.drop (param i32)))
+    (import "" "waitable.join" (func $waitable.join (param i32 i32)))
+
+    (global $r.src (mut i32) (i32.const 0))
+    (global $w.dst (mut i32) (i32.const 0))
 
     (func (export "drive") (param $r.src i32) (result i32)
       (local $t64 i64)
+      (global.set $r.src (local.get $r.src))
       (local.set $t64 (call $stream.new))
+      (global.set $w.dst (i32.wrap_i64 (i64.shr_u (local.get $t64) (i64.const 32))))
       (if (i32.ne (call $stream.forward
-                    (local.get $r.src)
-                    (i32.wrap_i64 (i64.shr_u (local.get $t64) (i64.const 32)))
+                    (global.get $r.src)
+                    (global.get $w.dst)
                     (i32.const 4))
                   (i32.const -1 (; BLOCKED ;)))
         (then unreachable))
       (i32.wrap_i64 (local.get $t64))
     )
+
+    (func (export "finish")
+      (local $ws i32)
+      ;; The destination's readable end is gone, so the forward settled with
+      ;; DROPPED(0); collect the event from the destination's write handle.
+      (local.set $ws (call $waitable-set.new))
+      (call $waitable.join (global.get $w.dst) (local.get $ws))
+      (if (i32.ne (call $waitable-set.wait (local.get $ws) (i32.const 16))
+                  (i32.const 7 (; STREAM_FORWARD ;)))
+        (then unreachable))
+      (if (i32.ne (i32.load (i32.const 16)) (global.get $w.dst))
+        (then unreachable))
+      (if (i32.ne (i32.load (i32.const 20)) (i32.const 0x1 (; DROPPED(0) ;)))
+        (then unreachable))
+      (call $waitable.join (global.get $w.dst) (i32.const 0))
+      (call $waitable-set.drop (local.get $ws))
+
+      (call $stream.drop-readable (global.get $r.src))
+      (call $stream.drop-writable (global.get $w.dst))
+    )
   )
 
   (core instance $i (instantiate $m
     (with "" (instance
+      (export "m" (memory $libc "m"))
       (export "stream.new" (func $stream.new))
       (export "stream.forward" (func $stream.forward))
+      (export "stream.drop-readable" (func $stream.drop-readable))
+      (export "stream.drop-writable" (func $stream.drop-writable))
+      (export "waitable-set.new" (func $waitable-set.new))
+      (export "waitable-set.wait" (func $waitable-set.wait))
+      (export "waitable-set.drop" (func $waitable-set.drop))
+      (export "waitable.join" (func $waitable.join))
     ))
   ))
 
   (func (export "drive") async (param "x" (stream u8)) (result (stream u8))
     (canon lift (core func $i "drive")))
+  (func (export "finish") async (canon lift (core func $i "finish")))
 )
 "#;
 
@@ -2609,6 +2659,581 @@ pub async fn async_cancel_forward_source_event_on_source_produce() -> Result<()>
         .await??;
 
     drop(tx);
+
+    Ok(())
+}
+
+/// A component whose `run` export async-cancels an in-flight host-produce
+/// rendezvous via both of the forward's handles, then collects a terminal
+/// `STREAM_FORWARD` event on each of them.
+const DOUBLE_CANCEL_FORWARD_FROM_HOST_PRODUCER: &str = r#"
+(component
+  (core module $libc (memory (export "m") 1))
+  (core instance $libc (instantiate $libc))
+
+  (type $s (stream u8))
+  (core func $stream.new (canon stream.new $s))
+  (core func $stream.read (canon stream.read $s async (memory (core memory $libc "m"))))
+  (core func $stream.forward (canon stream.forward $s async))
+  (core func $stream.cancel-read (canon stream.cancel-read $s async))
+  (core func $stream.cancel-write (canon stream.cancel-write $s async))
+  (core func $stream.drop-readable (canon stream.drop-readable $s))
+  (core func $stream.drop-writable (canon stream.drop-writable $s))
+  (core func $waitable-set.new (canon waitable-set.new))
+  (core func $waitable-set.wait (canon waitable-set.wait (memory (core memory $libc "m"))))
+  (core func $waitable-set.drop (canon waitable-set.drop))
+  (core func $waitable.join (canon waitable.join))
+
+  (core module $m
+    (import "" "m" (memory 1))
+    (import "" "stream.new" (func $stream.new (result i64)))
+    (import "" "stream.read" (func $stream.read (param i32 i32 i32) (result i32)))
+    (import "" "stream.forward" (func $stream.forward (param i32 i32 i32) (result i32)))
+    (import "" "stream.cancel-read" (func $stream.cancel-read (param i32) (result i32)))
+    (import "" "stream.cancel-write" (func $stream.cancel-write (param i32) (result i32)))
+    (import "" "stream.drop-readable" (func $stream.drop-readable (param i32)))
+    (import "" "stream.drop-writable" (func $stream.drop-writable (param i32)))
+    (import "" "waitable-set.new" (func $waitable-set.new (result i32)))
+    (import "" "waitable-set.wait" (func $waitable-set.wait (param i32 i32) (result i32)))
+    (import "" "waitable-set.drop" (func $waitable-set.drop (param i32)))
+    (import "" "waitable.join" (func $waitable.join (param i32 i32)))
+
+    (func $expect-forward-event (param $w i32) (param $code i32)
+      (local $ws i32)
+      (local.set $ws (call $waitable-set.new))
+      (call $waitable.join (local.get $w) (local.get $ws))
+      (if (i32.ne (call $waitable-set.wait (local.get $ws) (i32.const 16))
+                  (i32.const 7 (; STREAM_FORWARD ;)))
+        (then unreachable))
+      (if (i32.ne (i32.load (i32.const 16)) (local.get $w))
+        (then unreachable))
+      (if (i32.ne (i32.load (i32.const 20)) (local.get $code))
+        (then unreachable))
+      (call $waitable.join (local.get $w) (i32.const 0))
+      (call $waitable-set.drop (local.get $ws))
+    )
+
+    (func (export "run") (param $r.src i32)
+      (local $t64 i64)
+      (local $r.dst i32)
+      (local $w.dst i32)
+
+      (local.set $t64 (call $stream.new))
+      (local.set $r.dst (i32.wrap_i64 (local.get $t64)))
+      (local.set $w.dst (i32.wrap_i64 (i64.shr_u (local.get $t64) (i64.const 32))))
+
+      (if (i32.ne (call $stream.forward (local.get $r.src) (local.get $w.dst) (i32.const 4))
+                  (i32.const -1 (; BLOCKED ;)))
+        (then unreachable))
+
+      ;; This read starts a rendezvous with the host producer, which stays
+      ;; pending because the producer has nothing to deliver.
+      (if (i32.ne (call $stream.read (local.get $r.dst) (i32.const 8) (i32.const 4))
+                  (i32.const -1 (; BLOCKED ;)))
+        (then unreachable))
+
+      ;; Async-cancel the forward via both handles; each cancel blocks until
+      ;; the producer acknowledges.
+      (if (i32.ne (call $stream.cancel-write (local.get $w.dst))
+                  (i32.const -1 (; BLOCKED ;)))
+        (then unreachable))
+      (if (i32.ne (call $stream.cancel-read (local.get $r.src))
+                  (i32.const -1 (; BLOCKED ;)))
+        (then unreachable))
+
+      ;; Each cancelled handle receives its own terminal event.
+      (call $expect-forward-event (local.get $w.dst) (i32.const 0x2 (; CANCELLED(0) ;)))
+      (call $expect-forward-event (local.get $r.src) (i32.const 0x2 (; CANCELLED(0) ;)))
+
+      ;; The read survived the cancellation and is parked again.
+      (if (i32.ne (call $stream.cancel-read (local.get $r.dst))
+                  (i32.const 0x2 (; CANCELLED ;)))
+        (then unreachable))
+
+      (call $stream.drop-readable (local.get $r.src))
+      (call $stream.drop-readable (local.get $r.dst))
+      (call $stream.drop-writable (local.get $w.dst))
+    )
+  )
+
+  (core instance $i (instantiate $m
+    (with "" (instance
+      (export "m" (memory $libc "m"))
+      (export "stream.new" (func $stream.new))
+      (export "stream.read" (func $stream.read))
+      (export "stream.forward" (func $stream.forward))
+      (export "stream.cancel-read" (func $stream.cancel-read))
+      (export "stream.cancel-write" (func $stream.cancel-write))
+      (export "stream.drop-readable" (func $stream.drop-readable))
+      (export "stream.drop-writable" (func $stream.drop-writable))
+      (export "waitable-set.new" (func $waitable-set.new))
+      (export "waitable-set.wait" (func $waitable-set.wait))
+      (export "waitable-set.drop" (func $waitable-set.drop))
+      (export "waitable.join" (func $waitable.join))
+    ))
+  ))
+
+  (func (export "run") async (param "x" (stream u8)) (canon lift (core func $i "run")))
+)
+"#;
+
+/// Async-cancelling an in-flight host-produce rendezvous via both of the
+/// forward's handles delivers a terminal event on each of them rather than
+/// losing the first request.
+#[tokio::test]
+pub async fn async_double_cancel_forward_from_host_producer() -> Result<()> {
+    let engine = Engine::new(&config())?;
+    let mut store = new_store(&engine);
+
+    let component = Component::new(&engine, DOUBLE_CANCEL_FORWARD_FROM_HOST_PRODUCER)?;
+    let linker = Linker::new(&engine);
+    let instance = linker.instantiate_async(&mut store, &component).await?;
+    let func = instance.get_typed_func::<(StreamReader<u8>,), ()>(&mut store, "run")?;
+
+    let (tx, rx) = mpsc::channel::<u8>(1);
+    let rx = StreamReader::new(&mut store, PipeProducer::new(rx))?;
+
+    store
+        .run_concurrent(async |accessor| func.call_concurrent(accessor, (rx,)).await)
+        .await??;
+
+    drop(tx);
+
+    Ok(())
+}
+
+/// A component whose callback-lifted `wait` export registers a
+/// `stream.forward` and waits for its completion event on the destination's
+/// write handle, and whose `cancel` export cancels that forward from a
+/// sibling task via the source handle.
+const CANCEL_FORWARD_FROM_SIBLING_TASK: &str = r#"
+(component
+  (type $s (stream u8))
+  (core func $stream.new (canon stream.new $s))
+  (core func $stream.forward (canon stream.forward $s async))
+  (core func $stream.cancel-read (canon stream.cancel-read $s))
+  (core func $stream.drop-readable (canon stream.drop-readable $s))
+  (core func $stream.drop-writable (canon stream.drop-writable $s))
+  (core func $waitable-set.new (canon waitable-set.new))
+  (core func $waitable-set.drop (canon waitable-set.drop))
+  (core func $waitable.join (canon waitable.join))
+  (core func $task.return (canon task.return))
+
+  (core module $m
+    (import "" "stream.new" (func $stream.new (result i64)))
+    (import "" "stream.forward" (func $stream.forward (param i32 i32 i32) (result i32)))
+    (import "" "stream.cancel-read" (func $stream.cancel-read (param i32) (result i32)))
+    (import "" "stream.drop-readable" (func $stream.drop-readable (param i32)))
+    (import "" "stream.drop-writable" (func $stream.drop-writable (param i32)))
+    (import "" "waitable-set.new" (func $waitable-set.new (result i32)))
+    (import "" "waitable-set.drop" (func $waitable-set.drop (param i32)))
+    (import "" "waitable.join" (func $waitable.join (param i32 i32)))
+    (import "" "task.return" (func $task.return))
+
+    (global $r.src (mut i32) (i32.const 0))
+    (global $w.src (mut i32) (i32.const 0))
+    (global $r.dst (mut i32) (i32.const 0))
+    (global $w.dst (mut i32) (i32.const 0))
+    (global $ws (mut i32) (i32.const 0))
+
+    (func (export "wait") (result i32)
+      (local $t64 i64)
+
+      (local.set $t64 (call $stream.new))
+      (global.set $r.src (i32.wrap_i64 (local.get $t64)))
+      (global.set $w.src (i32.wrap_i64 (i64.shr_u (local.get $t64) (i64.const 32))))
+
+      (local.set $t64 (call $stream.new))
+      (global.set $r.dst (i32.wrap_i64 (local.get $t64)))
+      (global.set $w.dst (i32.wrap_i64 (i64.shr_u (local.get $t64) (i64.const 32))))
+
+      (if (i32.ne (call $stream.forward (global.get $r.src) (global.get $w.dst) (i32.const 4))
+                  (i32.const -1 (; BLOCKED ;)))
+        (then unreachable))
+
+      ;; Wait for the forward's terminal event; the sibling task's
+      ;; cancellation must deliver it here rather than stranding this task.
+      (global.set $ws (call $waitable-set.new))
+      (call $waitable.join (global.get $w.dst) (global.get $ws))
+      (i32.or (i32.shl (global.get $ws) (i32.const 4)) (i32.const 2 (; WAIT ;)))
+    )
+
+    (func (export "cb") (param $event i32) (param $w i32) (param $code i32) (result i32)
+      (if (i32.ne (local.get $event) (i32.const 7 (; STREAM_FORWARD ;)))
+        (then unreachable))
+      (if (i32.ne (local.get $w) (global.get $w.dst))
+        (then unreachable))
+      (if (i32.ne (local.get $code) (i32.const 0x2 (; CANCELLED(0) ;)))
+        (then unreachable))
+
+      (call $waitable.join (global.get $w.dst) (i32.const 0))
+      (call $waitable-set.drop (global.get $ws))
+
+      (call $stream.drop-readable (global.get $r.src))
+      (call $stream.drop-writable (global.get $w.src))
+      (call $stream.drop-readable (global.get $r.dst))
+      (call $stream.drop-writable (global.get $w.dst))
+
+      (call $task.return)
+      (i32.const 0 (; EXIT ;))
+    )
+
+    (func (export "cancel")
+      (if (i32.ne (call $stream.cancel-read (global.get $r.src))
+                  (i32.const 0x2 (; CANCELLED(0) ;)))
+        (then unreachable))
+    )
+  )
+
+  (core instance $i (instantiate $m
+    (with "" (instance
+      (export "stream.new" (func $stream.new))
+      (export "stream.forward" (func $stream.forward))
+      (export "stream.cancel-read" (func $stream.cancel-read))
+      (export "stream.drop-readable" (func $stream.drop-readable))
+      (export "stream.drop-writable" (func $stream.drop-writable))
+      (export "waitable-set.new" (func $waitable-set.new))
+      (export "waitable-set.drop" (func $waitable-set.drop))
+      (export "waitable.join" (func $waitable.join))
+      (export "task.return" (func $task.return))
+    ))
+  ))
+
+  (func (export "wait") async
+    (canon lift (core func $i "wait") async (callback (core func $i "cb"))))
+  (func (export "cancel") async (canon lift (core func $i "cancel")))
+)
+"#;
+
+/// Cancelling a pending forward from a sibling task while another task is
+/// waiting on the destination's write handle for the forward's completion
+/// delivers the `CANCELLED` event to the waiter instead of stranding it.
+#[tokio::test]
+pub async fn async_cancel_forward_from_sibling_task() -> Result<()> {
+    let engine = Engine::new(&config())?;
+    let mut store = new_store(&engine);
+
+    let component = Component::new(&engine, CANCEL_FORWARD_FROM_SIBLING_TASK)?;
+    let linker = Linker::new(&engine);
+    let instance = linker.instantiate_async(&mut store, &component).await?;
+    let wait = instance.get_typed_func::<(), ()>(&mut store, "wait")?;
+    let cancel = instance.get_typed_func::<(), ()>(&mut store, "cancel")?;
+
+    store
+        .run_concurrent(async |accessor| {
+            let (waited, cancelled) = futures::join!(wait.call_concurrent(accessor, ()), async {
+                // Give the `wait` task time to register the forward and start
+                // waiting before cancelling.
+                component_async_tests::util::yield_times(64).await;
+                cancel.call_concurrent(accessor, ()).await
+            });
+            waited.and(cancelled)
+        })
+        .await??;
+
+    Ok(())
+}
+
+/// Attaching a host consumer to the destination of a pending forward whose
+/// source is owned by a host producer fails, and the failure settles the
+/// forward with `DROPPED` rather than leaving it registered forever.
+#[tokio::test]
+pub async fn async_attach_consumer_to_forward_from_host_producer_settles_forward() -> Result<()> {
+    let engine = Engine::new(&config())?;
+    let mut store = new_store(&engine);
+
+    let component = Component::new(&engine, LIFT_DST_OF_FORWARD_FROM_HOST_PRODUCER)?;
+    let linker = Linker::new(&engine);
+    let instance = linker.instantiate_async(&mut store, &component).await?;
+    let drive =
+        instance.get_typed_func::<(StreamReader<u8>,), (StreamReader<u8>,)>(&mut store, "drive")?;
+    let finish = instance.get_typed_func::<(), ()>(&mut store, "finish")?;
+
+    let (_tx, src_rx) = mpsc::channel::<u8>(1);
+    let src = StreamReader::new(&mut store, PipeProducer::new(src_rx))?;
+    let (sink_tx, _sink_rx) = mpsc::channel::<u8>(4);
+
+    store
+        .run_concurrent(async move |accessor| {
+            let (reader,) = drive.call_concurrent(accessor, (src,)).await?;
+            let error = accessor
+                .with(|mut store| reader.pipe(&mut store, PipeConsumer::new(sink_tx)))
+                .expect_err("expected attaching the consumer to fail");
+            let message = format!("{error:?}");
+            assert!(
+                message.contains("cannot `stream.forward` between two host-owned stream ends"),
+                "unexpected error: {message}"
+            );
+            finish.call_concurrent(accessor, ()).await
+        })
+        .await??;
+
+    Ok(())
+}
+
+/// A component whose `produce` export hands the readable end of a stream to
+/// the host and whose `drive` export leaves a grafted write's async
+/// cancellation to settle in the background, then observes its queued result
+/// through another `stream.cancel-write`.
+const CANCEL_GRAFTED_WRITE_IN_BACKGROUND: &str = r#"
+(component
+  (core module $libc (memory (export "m") 1))
+  (core instance $libc (instantiate $libc))
+
+  (type $s (stream u8))
+  (core func $stream.new (canon stream.new $s))
+  (core func $stream.write (canon stream.write $s async (memory (core memory $libc "m"))))
+  (core func $stream.forward (canon stream.forward $s async))
+  (core func $stream.cancel-read (canon stream.cancel-read $s))
+  (core func $stream.cancel-write (canon stream.cancel-write $s))
+  (core func $stream.cancel-write-async (canon stream.cancel-write $s async))
+  (core func $stream.drop-readable (canon stream.drop-readable $s))
+  (core func $stream.drop-writable (canon stream.drop-writable $s))
+
+  (core module $m
+    (import "" "m" (memory 1))
+    (import "" "stream.new" (func $stream.new (result i64)))
+    (import "" "stream.write" (func $stream.write (param i32 i32 i32) (result i32)))
+    (import "" "stream.forward" (func $stream.forward (param i32 i32 i32) (result i32)))
+    (import "" "stream.cancel-read" (func $stream.cancel-read (param i32) (result i32)))
+    (import "" "stream.cancel-write" (func $stream.cancel-write (param i32) (result i32)))
+    (import "" "stream.cancel-write-async" (func $stream.cancel-write-async (param i32) (result i32)))
+    (import "" "stream.drop-readable" (func $stream.drop-readable (param i32)))
+    (import "" "stream.drop-writable" (func $stream.drop-writable (param i32)))
+
+    (global $w2 (mut i32) (i32.const 0))
+
+    (func (export "produce") (result i32)
+      (local $t64 i64)
+      (local.set $t64 (call $stream.new))
+      (global.set $w2 (i32.wrap_i64 (i64.shr_u (local.get $t64) (i64.const 32))))
+      (i32.wrap_i64 (local.get $t64))
+    )
+
+    (func (export "drive")
+      (local $t64 i64)
+      (local $r1 i32)
+      (local $w1 i32)
+
+      (local.set $t64 (call $stream.new))
+      (local.set $r1 (i32.wrap_i64 (local.get $t64)))
+      (local.set $w1 (i32.wrap_i64 (i64.shr_u (local.get $t64) (i64.const 32))))
+
+      ;; Park a write, then graft it onto the host consumer, which never
+      ;; accepts anything, so the rendezvous stays in flight.
+      (if (i32.ne (call $stream.write (local.get $w1) (i32.const 0) (i32.const 4))
+                  (i32.const -1 (; BLOCKED ;)))
+        (then unreachable))
+      (if (i32.ne (call $stream.forward (local.get $r1) (global.get $w2) (i32.const 4))
+                  (i32.const -1 (; BLOCKED ;)))
+        (then unreachable))
+
+      ;; Async-cancel the grafted write; the request is routed to the
+      ;; consumer and blocks until it acknowledges.
+      (if (i32.ne (call $stream.cancel-write-async (local.get $w1))
+                  (i32.const -1 (; BLOCKED ;)))
+        (then unreachable))
+
+      ;; Sync-cancel the forward via its source handle; while this waits,
+      ;; the consumer acknowledges both cancellations, queueing the write's
+      ;; CANCELLED(0) completion on its handle.
+      (if (i32.ne (call $stream.cancel-read (local.get $r1))
+                  (i32.const 0x2 (; CANCELLED(0) ;)))
+        (then unreachable))
+
+      ;; A second cancel finds the queued completion and reports it.
+      (if (i32.ne (call $stream.cancel-write (local.get $w1))
+                  (i32.const 0x2 (; CANCELLED(0) ;)))
+        (then unreachable))
+
+      (call $stream.drop-readable (local.get $r1))
+      (call $stream.drop-writable (local.get $w1))
+      (call $stream.drop-writable (global.get $w2))
+    )
+  )
+
+  (core instance $i (instantiate $m
+    (with "" (instance
+      (export "m" (memory $libc "m"))
+      (export "stream.new" (func $stream.new))
+      (export "stream.write" (func $stream.write))
+      (export "stream.forward" (func $stream.forward))
+      (export "stream.cancel-read" (func $stream.cancel-read))
+      (export "stream.cancel-write" (func $stream.cancel-write))
+      (export "stream.cancel-write-async" (func $stream.cancel-write-async))
+      (export "stream.drop-readable" (func $stream.drop-readable))
+      (export "stream.drop-writable" (func $stream.drop-writable))
+    ))
+  ))
+
+  (func (export "produce") async (result (stream u8))
+    (canon lift (core func $i "produce")))
+  (func (export "drive") async (canon lift (core func $i "drive")))
+)
+"#;
+
+/// A `stream.cancel-write` that finds the queued `CANCELLED` completion of an
+/// earlier async cancellation reports it instead of trapping.
+#[tokio::test]
+pub async fn async_cancel_grafted_write_in_background() -> Result<()> {
+    let engine = Engine::new(&config())?;
+    let mut store = new_store(&engine);
+
+    let component = Component::new(&engine, CANCEL_GRAFTED_WRITE_IN_BACKGROUND)?;
+    let linker = Linker::new(&engine);
+    let instance = linker.instantiate_async(&mut store, &component).await?;
+    let produce = instance.get_typed_func::<(), (StreamReader<u8>,)>(&mut store, "produce")?;
+    let drive = instance.get_typed_func::<(), ()>(&mut store, "drive")?;
+
+    let (mut tx, rx) = mpsc::channel(0);
+    tx.try_send(9_u8).unwrap();
+
+    store
+        .run_concurrent(async move |accessor| {
+            let (reader,) = produce.call_concurrent(accessor, ()).await?;
+            accessor.with(|mut store| reader.pipe(&mut store, PipeConsumer::new(tx)))?;
+            drive.call_concurrent(accessor, ()).await
+        })
+        .await??;
+
+    drop(rx);
+
+    Ok(())
+}
+
+/// A component whose `produce` export hands the readable end of a stream to
+/// the host and whose `drive` export completes a synchronous `stream.forward`
+/// into it, blocking until the host consumer becomes ready.
+const SYNC_FORWARD_TO_HOST_CONSUMER: &str = r#"
+(component
+  (core module $libc (memory (export "m") 1))
+  (core instance $libc (instantiate $libc))
+
+  (type $s (stream u8))
+  (core func $stream.new (canon stream.new $s))
+  (core func $stream.write (canon stream.write $s async (memory (core memory $libc "m"))))
+  (core func $stream.forward (canon stream.forward $s))
+  (core func $stream.drop-readable (canon stream.drop-readable $s))
+  (core func $stream.drop-writable (canon stream.drop-writable $s))
+  (core func $waitable-set.new (canon waitable-set.new))
+  (core func $waitable-set.wait (canon waitable-set.wait (memory (core memory $libc "m"))))
+  (core func $waitable-set.drop (canon waitable-set.drop))
+  (core func $waitable.join (canon waitable.join))
+
+  (core module $m
+    (import "" "m" (memory 1))
+    (import "" "stream.new" (func $stream.new (result i64)))
+    (import "" "stream.write" (func $stream.write (param i32 i32 i32) (result i32)))
+    (import "" "stream.forward" (func $stream.forward (param i32 i32 i32) (result i32)))
+    (import "" "stream.drop-readable" (func $stream.drop-readable (param i32)))
+    (import "" "stream.drop-writable" (func $stream.drop-writable (param i32)))
+    (import "" "waitable-set.new" (func $waitable-set.new (result i32)))
+    (import "" "waitable-set.wait" (func $waitable-set.wait (param i32 i32) (result i32)))
+    (import "" "waitable-set.drop" (func $waitable-set.drop (param i32)))
+    (import "" "waitable.join" (func $waitable.join (param i32 i32)))
+
+    (global $w2 (mut i32) (i32.const 0))
+
+    (func (export "produce") (result i32)
+      (local $t64 i64)
+      (local.set $t64 (call $stream.new))
+      (global.set $w2 (i32.wrap_i64 (i64.shr_u (local.get $t64) (i64.const 32))))
+      (i32.wrap_i64 (local.get $t64))
+    )
+
+    (func (export "drive")
+      (local $t64 i64)
+      (local $r1 i32)
+      (local $w1 i32)
+      (local $ws i32)
+
+      (local.set $t64 (call $stream.new))
+      (local.set $r1 (i32.wrap_i64 (local.get $t64)))
+      (local.set $w1 (i32.wrap_i64 (i64.shr_u (local.get $t64) (i64.const 32))))
+
+      ;; Park a single-item write, then forward it synchronously; the host
+      ;; consumer is not ready yet, so the rendezvous completes in the
+      ;; background and must wake this task when it settles.
+      (i32.store8 (i32.const 0) (i32.const 42))
+      (if (i32.ne (call $stream.write (local.get $w1) (i32.const 0) (i32.const 1))
+                  (i32.const -1 (; BLOCKED ;)))
+        (then unreachable))
+      (if (i32.ne (call $stream.forward (local.get $r1) (global.get $w2) (i32.const 1))
+                  (i32.const 0x10 (; (1<<4) | COMPLETED ;)))
+        (then unreachable))
+
+      ;; The write's completion event is already queued.
+      (local.set $ws (call $waitable-set.new))
+      (call $waitable.join (local.get $w1) (local.get $ws))
+      (if (i32.ne (call $waitable-set.wait (local.get $ws) (i32.const 16))
+                  (i32.const 3 (; STREAM_WRITE ;)))
+        (then unreachable))
+      (if (i32.ne (i32.load (i32.const 16)) (local.get $w1))
+        (then unreachable))
+      (if (i32.ne (i32.load (i32.const 20)) (i32.const 0x10 (; (1<<4) | COMPLETED ;)))
+        (then unreachable))
+      (call $waitable.join (local.get $w1) (i32.const 0))
+      (call $waitable-set.drop (local.get $ws))
+
+      (call $stream.drop-readable (local.get $r1))
+      (call $stream.drop-writable (local.get $w1))
+      (call $stream.drop-writable (global.get $w2))
+    )
+  )
+
+  (core instance $i (instantiate $m
+    (with "" (instance
+      (export "m" (memory $libc "m"))
+      (export "stream.new" (func $stream.new))
+      (export "stream.write" (func $stream.write))
+      (export "stream.forward" (func $stream.forward))
+      (export "stream.drop-readable" (func $stream.drop-readable))
+      (export "stream.drop-writable" (func $stream.drop-writable))
+      (export "waitable-set.new" (func $waitable-set.new))
+      (export "waitable-set.wait" (func $waitable-set.wait))
+      (export "waitable-set.drop" (func $waitable-set.drop))
+      (export "waitable.join" (func $waitable.join))
+    ))
+  ))
+
+  (func (export "produce") async (result (stream u8))
+    (canon lift (core func $i "produce")))
+  (func (export "drive") async (canon lift (core func $i "drive")))
+)
+"#;
+
+/// A synchronous `stream.forward` into a host consumer that only becomes
+/// ready later blocks until the background rendezvous settles, then reports
+/// `COMPLETED`.
+#[tokio::test]
+pub async fn async_sync_forward_to_host_consumer() -> Result<()> {
+    let engine = Engine::new(&config())?;
+    let mut store = new_store(&engine);
+
+    let component = Component::new(&engine, SYNC_FORWARD_TO_HOST_CONSUMER)?;
+    let linker = Linker::new(&engine);
+    let instance = linker.instantiate_async(&mut store, &component).await?;
+    let produce = instance.get_typed_func::<(), (StreamReader<u8>,)>(&mut store, "produce")?;
+    let drive = instance.get_typed_func::<(), ()>(&mut store, "drive")?;
+
+    let (mut tx, mut rx) = mpsc::channel(0);
+    tx.try_send(9_u8).unwrap();
+
+    store
+        .run_concurrent(async move |accessor| {
+            let (reader,) = produce.call_concurrent(accessor, ()).await?;
+            accessor.with(|mut store| reader.pipe(&mut store, PipeConsumer::new(tx)))?;
+            let (drove, ()) = futures::join!(drive.call_concurrent(accessor, ()), async {
+                // By this point `drive` is sync-blocked in its forward with
+                // the consumer pending; draining the channel lets the
+                // consumer accept the item and settle the rendezvous.
+                assert_eq!(Some(9), rx.next().await);
+                assert_eq!(Some(42), rx.next().await);
+                assert!(rx.next().await.is_none());
+            });
+            drove
+        })
+        .await??;
 
     Ok(())
 }
