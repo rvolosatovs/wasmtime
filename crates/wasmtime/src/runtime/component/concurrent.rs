@@ -163,7 +163,13 @@ enum Event {
     StreamForward {
         code: ReturnCode,
         pending: Option<(TypeStreamTableIndex, u32)>,
-        dst_dropped: bool,
+        /// Whether this event is delivered on the source's read handle (for
+        /// a source-initiated cancellation) rather than the destination's
+        /// write handle.
+        src: bool,
+        /// Whether the peer end of the handle this event restores was
+        /// dropped.
+        dropped: bool,
     },
     FutureRead {
         code: ReturnCode,
