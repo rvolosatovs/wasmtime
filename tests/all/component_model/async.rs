@@ -1184,11 +1184,11 @@ fn inter_component_stream_is_not_intra_component() -> Result<()> {
 }
 
 /// Transferring the readable end of a `stream.forward` destination to the
-/// host is rejected at lift time rather than leaving the host with a
-/// `StreamReader` it can never use.
+/// host succeeds, and dropping it on the host side settles the pending
+/// forward.
 #[test]
 #[cfg_attr(miri, ignore)]
-fn stream_forward_dst_readable_end_cannot_be_lifted() -> Result<()> {
+fn stream_forward_dst_readable_end_can_be_lifted() -> Result<()> {
     let mut config = Config::new();
     config.wasm_component_model_async(true);
     config.wasm_component_model_more_async_builtins(true);
@@ -1243,21 +1243,18 @@ fn stream_forward_dst_readable_end_cannot_be_lifted() -> Result<()> {
     let instance = Linker::new(&engine).instantiate(&mut store, &component)?;
     let mk = instance.get_typed_func::<(), (StreamReader<u8>,)>(&mut store, "mk")?;
 
-    let error = format!("{:?}", mk.call(&mut store, ()).unwrap_err());
-    assert!(
-        error.contains("cannot transfer the read end of a stream with a pending `stream.forward` to the host"),
-        "unexpected error: {error}"
-    );
+    let (mut reader,) = mk.call(&mut store, ())?;
+    reader.close(&mut store)?;
 
     Ok(())
 }
 
 /// A `stream.forward` whose destination's readable end is already owned by
-/// the host (but idle) is rejected at registration, before the host's later
-/// read could observe a half-registered forward.
+/// the host (but idle) registers and blocks, ready to rendezvous once the
+/// host attaches a consumer.
 #[test]
 #[cfg_attr(miri, ignore)]
-fn stream_forward_rejects_host_owned_dst_readable_end() -> Result<()> {
+fn stream_forward_accepts_host_owned_dst_readable_end() -> Result<()> {
     let mut config = Config::new();
     config.wasm_component_model_async(true);
     config.wasm_component_model_more_async_builtins(true);
@@ -1317,11 +1314,8 @@ fn stream_forward_rejects_host_owned_dst_readable_end() -> Result<()> {
     // but don't attach a consumer to it.
     let (_reader,) = mk.call(&mut store, ())?;
 
-    let error = format!("{:?}", fwd.call(&mut store, ()).unwrap_err());
-    assert!(
-        error.contains("stream.forward involving host-owned streams is not yet supported"),
-        "unexpected error: {error}"
-    );
+    let (code,) = fwd.call(&mut store, ())?;
+    assert_eq!(code, 0xffff_ffff, "expected BLOCKED; got {code:#x}");
 
     Ok(())
 }

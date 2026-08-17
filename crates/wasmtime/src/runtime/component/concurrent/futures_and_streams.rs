@@ -1852,15 +1852,7 @@ pub(super) fn lift_index_to_stream(
     match ty {
         InterfaceType::Stream(src) => {
             let (state, instance) = cx.concurrent_state_and_instance_mut();
-            let id = lift_index_to_transmit(instance, state, TransmitIndex::Stream(src), index)?;
-            let transmit_id = state.get_mut(id)?.state;
-            if let WriteState::Forwarding(_) = &state.get_mut(transmit_id)?.write {
-                bail!(
-                    "cannot transfer the read end of a stream with a pending `stream.forward` \
-                     to the host"
-                );
-            }
-            Ok(id)
+            lift_index_to_transmit(instance, state, TransmitIndex::Stream(src), index)
         }
         _ => func::bad_type_info(),
     }
@@ -2235,6 +2227,12 @@ struct ForwardState {
     src_handle: u32,
     /// The forwarding guest's handle for the destination stream's write end.
     dst_handle: u32,
+    /// Whether the forwarding guest requested cancellation of this forward
+    /// while a host rendezvous was in flight.
+    cancel_forward: bool,
+    /// Whether the guest peer whose operation is grafted into an in-flight
+    /// host rendezvous requested cancellation of that operation.
+    cancel_peer: bool,
 }
 
 /// Restore the forwarding guest's source handle entry from `Busy` back to
@@ -2334,6 +2332,217 @@ struct ForwardCopyOutcome {
     write_complete: bool,
     /// Whether the read operation completed per the same rules.
     read_complete: bool,
+}
+
+/// Identifies the live guest party, if any, of a `stream.forward` rendezvous
+/// with a host-owned endpoint, i.e. the party whose call triggered the
+/// rendezvous and which receives its result as a return code rather than an
+/// event.
+#[derive(Copy, Clone, PartialEq)]
+enum ForwardParty {
+    /// The forwarding guest itself, via `stream.forward`.
+    Forward,
+    /// The guest peer: the source's writer or the destination's reader.
+    Peer,
+    /// No live guest party: the rendezvous was host-initiated or is being
+    /// completed in the background.
+    None,
+}
+
+/// Complete a rendezvous between the host producer owning the source's write
+/// end and a guest read on the destination of the specified forward.
+///
+/// `read_state` must be the original (unclamped) `ReadState::GuestReady`
+/// detached from the destination when the rendezvous began, and `code` the
+/// result of `settle_host_write` for the batch. Routes the reader's result
+/// (directly, as an event, or by re-parking the read), then settles or
+/// re-registers the forward. Returns the live party's code plus the done flag
+/// for the forwarding guest's source handle.
+fn finish_forward_produce(
+    store: &mut StoreOpaque,
+    fwd: &ForwardState,
+    read_state: ReadState,
+    code: ReturnCode,
+    live: ForwardParty,
+) -> Result<(ReturnCode, bool)> {
+    let ReadState::GuestReady {
+        ty: read_ty,
+        handle: read_handle,
+        ..
+    } = &read_state
+    else {
+        bail_bug!("expected `ReadState::GuestReady`; got `{read_state:?}`");
+    };
+    let (read_ty, read_handle) = (*read_ty, *read_handle);
+    let (ReturnCode::Completed(copied)
+    | ReturnCode::Dropped(copied)
+    | ReturnCode::Cancelled(copied)) = code
+    else {
+        bail_bug!("unexpected return code: {code:?}");
+    };
+
+    let state = store.concurrent_state_mut()?;
+    let (cancel_forward, cancel_peer) = match &state.get_mut(fwd.dst)?.write {
+        WriteState::Forwarding(f) => (f.cancel_forward, f.cancel_peer),
+        state => bail_bug!("expected `WriteState::Forwarding`; got `{state:?}`"),
+    };
+
+    // Route the reader's result. The reader never observes the producer's
+    // `DROPPED` directly: its own peer is the forwarding guest, which still
+    // holds the destination's write end, so a terminal producer merely
+    // completes the read with whatever items it delivered, or leaves the read
+    // parked when there are none.
+    let reader_code = if cancel_peer {
+        Some(ReturnCode::Cancelled(copied))
+    } else if copied > 0 || matches!(code, ReturnCode::Completed(_)) {
+        Some(ReturnCode::completed(TransmitKind::Stream, copied))
+    } else {
+        None
+    };
+    match (reader_code, live) {
+        (Some(code), ForwardParty::Forward | ForwardParty::None) => {
+            state.send_read_result(read_ty, fwd.dst, read_handle, code)?;
+        }
+        (Some(_), ForwardParty::Peer) => {}
+        (None, _) => state.get_mut(fwd.dst)?.read = read_state,
+    }
+
+    // Settle the forward itself.
+    let forwarded = fwd.forwarded.add(copied)?;
+    let fwd = ForwardState {
+        forwarded,
+        cancel_forward: false,
+        cancel_peer: false,
+        ..*fwd
+    };
+    let (forward_code, src_done) = if cancel_forward {
+        (ReturnCode::Cancelled(forwarded), false)
+    } else {
+        match code {
+            // The forward's budget is exhausted, so it completes even if this
+            // batch also reported the host end terminal; the done flag on the
+            // forwarding guest's handle records the latter.
+            _ if forwarded == fwd.count => (
+                ReturnCode::Completed(fwd.count),
+                matches!(code, ReturnCode::Dropped(_)),
+            ),
+            ReturnCode::Completed(_) | ReturnCode::Cancelled(_) => {
+                store.concurrent_state_mut()?.register_forward(fwd)?;
+                let code = match live {
+                    ForwardParty::Peer => reader_code.unwrap_or(ReturnCode::Blocked),
+                    _ => ReturnCode::Blocked,
+                };
+                return Ok((code, false));
+            }
+            ReturnCode::Dropped(_) => (ReturnCode::Dropped(forwarded), true),
+            ReturnCode::Blocked => unreachable!(),
+        }
+    };
+    if let ForwardParty::Forward = live {
+        store
+            .concurrent_state_mut()?
+            .clear_forward(fwd.src, fwd.dst)?;
+        Ok((forward_code, src_done))
+    } else {
+        finish_forward(store, &fwd, forward_code, false, src_done)?;
+        Ok((reader_code.unwrap_or(ReturnCode::Blocked), false))
+    }
+}
+
+/// Complete a rendezvous between a guest write on the source and the host
+/// consumer owning the destination's read end of the specified forward.
+///
+/// `write_state` must be the original (unclamped) `WriteState::GuestReady`
+/// detached from the source when the rendezvous began, and `code` the result
+/// of `settle_host_read` for the batch. Routes the writer's result, then
+/// settles or re-registers the forward. Returns the live party's code plus
+/// the done flag for the forwarding guest's destination handle.
+fn finish_forward_consume(
+    store: &mut StoreOpaque,
+    fwd: &ForwardState,
+    write_state: WriteState,
+    code: ReturnCode,
+    live: ForwardParty,
+) -> Result<(ReturnCode, bool)> {
+    let WriteState::GuestReady {
+        ty: write_ty,
+        handle: write_handle,
+        ..
+    } = &write_state
+    else {
+        bail_bug!("expected `WriteState::GuestReady`; got `{write_state:?}`");
+    };
+    let (write_ty, write_handle) = (*write_ty, *write_handle);
+    let (ReturnCode::Completed(copied)
+    | ReturnCode::Dropped(copied)
+    | ReturnCode::Cancelled(copied)) = code
+    else {
+        bail_bug!("unexpected return code: {code:?}");
+    };
+
+    let state = store.concurrent_state_mut()?;
+    let (cancel_forward, cancel_peer) = match &state.get_mut(fwd.src)?.read {
+        ReadState::Forwarding(f) => (f.cancel_forward, f.cancel_peer),
+        state => bail_bug!("expected `ReadState::Forwarding`; got `{state:?}`"),
+    };
+
+    // Route the writer's result; like the reader in `finish_forward_produce`,
+    // the writer never observes the consumer's `DROPPED` directly.
+    let writer_code = if cancel_peer {
+        Some(ReturnCode::Cancelled(copied))
+    } else if copied > 0 || matches!(code, ReturnCode::Completed(_)) {
+        Some(ReturnCode::completed(TransmitKind::Stream, copied))
+    } else {
+        None
+    };
+    match (writer_code, live) {
+        (Some(code), ForwardParty::Forward | ForwardParty::None) => {
+            state.send_write_result(write_ty, fwd.src, write_handle, code)?;
+        }
+        (Some(_), ForwardParty::Peer) => {}
+        (None, _) => state.get_mut(fwd.src)?.write = write_state,
+    }
+
+    // Settle the forward itself.
+    let forwarded = fwd.forwarded.add(copied)?;
+    let fwd = ForwardState {
+        forwarded,
+        cancel_forward: false,
+        cancel_peer: false,
+        ..*fwd
+    };
+    let (forward_code, dst_done) = if cancel_forward {
+        (ReturnCode::Cancelled(forwarded), false)
+    } else {
+        match code {
+            // The forward's budget is exhausted, so it completes even if this
+            // batch also reported the host end terminal; the done flag on the
+            // forwarding guest's handle records the latter.
+            _ if forwarded == fwd.count => (
+                ReturnCode::Completed(fwd.count),
+                matches!(code, ReturnCode::Dropped(_)),
+            ),
+            ReturnCode::Completed(_) | ReturnCode::Cancelled(_) => {
+                store.concurrent_state_mut()?.register_forward(fwd)?;
+                let code = match live {
+                    ForwardParty::Peer => writer_code.unwrap_or(ReturnCode::Blocked),
+                    _ => ReturnCode::Blocked,
+                };
+                return Ok((code, false));
+            }
+            ReturnCode::Dropped(_) => (ReturnCode::Dropped(forwarded), true),
+            ReturnCode::Blocked => unreachable!(),
+        }
+    };
+    if let ForwardParty::Forward = live {
+        store
+            .concurrent_state_mut()?
+            .clear_forward(fwd.src, fwd.dst)?;
+        Ok((forward_code, dst_done))
+    } else {
+        finish_forward(store, &fwd, forward_code, dst_done, false)?;
+        Ok((writer_code.unwrap_or(ReturnCode::Blocked), false))
+    }
 }
 
 /// Represents the state of the write end of a stream or future.
@@ -2547,6 +2756,171 @@ impl StoreOpaque {
 
         self.concurrent_state_mut_already_forced_current_thread()
             .push_future(future.boxed());
+    }
+
+    /// Complete a pending host-produce rendezvous for a `stream.forward` in
+    /// the background: settle the producer's batch on the source, then route
+    /// the results via `finish_forward_produce`.
+    fn pipe_forward_to_guest(
+        &mut self,
+        fwd: ForwardState,
+        read_state: ReadState,
+        future: Pin<Box<dyn Future<Output = Result<StreamResult>> + Send + 'static>>,
+    ) {
+        let future = async move {
+            let stream_state = future.await?;
+            tls::get(|store| {
+                let transmit = store.concurrent_state_mut()?.get_mut(fwd.src)?;
+                let code = settle_host_write(transmit, TransmitKind::Stream, stream_state)?;
+                transmit.read = ReadState::Open;
+                finish_forward_produce(store, &fwd, read_state, code, ForwardParty::None)?;
+                Ok(())
+            })
+        };
+
+        self.concurrent_state_mut_already_forced_current_thread()
+            .push_future(future.boxed());
+    }
+
+    /// Complete a pending host-consume rendezvous for a `stream.forward` in
+    /// the background: settle the consumer's batch on the destination, then
+    /// route the results via `finish_forward_consume`.
+    fn pipe_forward_from_guest(
+        &mut self,
+        fwd: ForwardState,
+        write_state: WriteState,
+        future: Pin<Box<dyn Future<Output = Result<StreamResult>> + Send + 'static>>,
+    ) {
+        let future = async move {
+            let stream_state = future.await?;
+            tls::get(|store| {
+                let transmit = store.concurrent_state_mut()?.get_mut(fwd.dst)?;
+                let code = settle_host_read(transmit, TransmitKind::Stream, stream_state)?;
+                transmit.write = WriteState::Open;
+                finish_forward_consume(store, &fwd, write_state, code, ForwardParty::None)?;
+                Ok(())
+            })
+        };
+
+        self.concurrent_state_mut_already_forced_current_thread()
+            .push_future(future.boxed());
+    }
+
+    /// If the read side of the specified transmit currently holds a guest read
+    /// grafted from the destination of a pending `stream.forward` (i.e. the
+    /// transmit is the source of a forward with a host-produce rendezvous in
+    /// flight), return that forward's state.
+    fn forward_produce_graft(
+        &mut self,
+        id: TableId<TransmitState>,
+    ) -> Result<Option<ForwardState>> {
+        let state = self.concurrent_state_mut()?;
+        let transmit = state.get_mut(id)?;
+        if !matches!(&transmit.write, WriteState::HostReady { .. }) {
+            return Ok(None);
+        }
+        let own = transmit.read_handle.rep();
+        let &ReadState::GuestReady {
+            instance,
+            ty,
+            handle,
+            ..
+        } = &transmit.read
+        else {
+            return Ok(None);
+        };
+        let (rep, _) = instance.id().get_mut(self).get_mut_by_index(ty, handle)?;
+        if rep == own {
+            return Ok(None);
+        }
+        let state = self.concurrent_state_mut()?;
+        let dst = state.get_mut(TableId::<TransmitHandle>::new(rep))?.state;
+        match &state.get_mut(dst)?.write {
+            &WriteState::Forwarding(fwd) if fwd.src == id => Ok(Some(fwd)),
+            state => bail_bug!("expected `WriteState::Forwarding`; got `{state:?}`"),
+        }
+    }
+
+    /// If the write side of the specified transmit currently holds a guest
+    /// write grafted from the source of a pending `stream.forward` (i.e. the
+    /// transmit is the destination of a forward with a host-consume rendezvous
+    /// in flight), return that forward's state.
+    fn forward_consume_graft(
+        &mut self,
+        id: TableId<TransmitState>,
+    ) -> Result<Option<ForwardState>> {
+        let state = self.concurrent_state_mut()?;
+        let transmit = state.get_mut(id)?;
+        if !matches!(&transmit.read, ReadState::HostReady { .. }) {
+            return Ok(None);
+        }
+        let own = transmit.write_handle.rep();
+        let &WriteState::GuestReady {
+            instance,
+            ty,
+            handle,
+            ..
+        } = &transmit.write
+        else {
+            return Ok(None);
+        };
+        let (rep, _) = instance.id().get_mut(self).get_mut_by_index(ty, handle)?;
+        if rep == own {
+            return Ok(None);
+        }
+        let state = self.concurrent_state_mut()?;
+        let src = state.get_mut(TableId::<TransmitHandle>::new(rep))?.state;
+        match &state.get_mut(src)?.read {
+            &ReadState::Forwarding(fwd) if fwd.dst == id => Ok(Some(fwd)),
+            state => bail_bug!("expected `ReadState::Forwarding`; got `{state:?}`"),
+        }
+    }
+
+    /// Request cancellation of the host rendezvous currently in flight for the
+    /// specified forward, recording which party requested it so completion can
+    /// route the results accordingly.
+    fn request_forward_cancel(&mut self, fwd: &ForwardState, forward: bool) -> Result<()> {
+        let state = self.concurrent_state_mut()?;
+        if let WriteState::HostReady {
+            cancel,
+            cancel_waker,
+            ..
+        } = &mut state.get_mut(fwd.src)?.write
+        {
+            *cancel = true;
+            if let Some(waker) = cancel_waker.take() {
+                waker.wake();
+            }
+            let WriteState::Forwarding(f) = &mut state.get_mut(fwd.dst)?.write else {
+                bail_bug!("expected `WriteState::Forwarding`");
+            };
+            *(if forward {
+                &mut f.cancel_forward
+            } else {
+                &mut f.cancel_peer
+            }) = true;
+        } else if let ReadState::HostReady {
+            cancel,
+            cancel_waker,
+            ..
+        } = &mut state.get_mut(fwd.dst)?.read
+        {
+            *cancel = true;
+            if let Some(waker) = cancel_waker.take() {
+                waker.wake();
+            }
+            let ReadState::Forwarding(f) = &mut state.get_mut(fwd.src)?.read else {
+                bail_bug!("expected `ReadState::Forwarding`");
+            };
+            *(if forward {
+                &mut f.cancel_forward
+            } else {
+                &mut f.cancel_peer
+            }) = true;
+        } else {
+            bail_bug!("no host rendezvous in flight for forward");
+        }
+        Ok(())
     }
 
     /// Drop the read end of a stream or future read from the host.
@@ -3128,8 +3502,49 @@ impl<T> StoreContextMut<'_, T> {
 
                 state.push_future(Box::pin(future));
             }
-            WriteState::Forwarding(_) => {
-                bail!("stream.forward involving host-owned streams is not yet supported")
+            WriteState::Forwarding(fwd) => {
+                let fwd = *fwd;
+                let src_tx = state.get_mut(fwd.src)?;
+                match &src_tx.write {
+                    WriteState::HostReady { .. } => {
+                        bail!("cannot `stream.forward` between two host-owned stream ends")
+                    }
+                    WriteState::GuestReady { .. } if fwd.forwarded < fwd.count => {
+                        let write_state = mem::replace(&mut src_tx.write, WriteState::Open);
+                        Instance::forward_consume(
+                            self.as_context_mut(),
+                            &fwd,
+                            consume,
+                            write_state,
+                            ForwardParty::None,
+                        )?;
+                    }
+                    WriteState::GuestReady { .. } | WriteState::Open => {
+                        let probe = matches!(&src_tx.write, WriteState::GuestReady { .. });
+                        state.get_mut(id)?.read = ReadState::HostReady {
+                            consume,
+                            guest_offset: ItemCount::ZERO,
+                            cancel: false,
+                            cancel_waker: None,
+                        };
+                        if probe {
+                            // A zero-budget forward is a readiness probe which
+                            // the parked write and this consumer jointly
+                            // satisfy.
+                            finish_forward(
+                                self.0,
+                                &fwd,
+                                ReturnCode::Completed(fwd.count),
+                                false,
+                                false,
+                            )?;
+                        }
+                    }
+                    state => bail_bug!(
+                        "unexpected write state for the source of a pending \
+                         `stream.forward`: {state:?}"
+                    ),
+                }
             }
             WriteState::Dropped => {
                 let reader = transmit.read_handle;
@@ -3808,6 +4223,175 @@ impl Instance {
         })
     }
 
+    /// Rendezvous the host producer owning the source's write end of the
+    /// specified forward with a guest read on its destination.
+    ///
+    /// `produce` and `try_into` must have been detached from the source's
+    /// `WriteState::HostReady` and `read_state` (a `ReadState::GuestReady`)
+    /// from the destination's read side. The read is grafted onto the source,
+    /// clamped to the forward's remaining budget, so the single-transmit host
+    /// `produce` machinery can deliver items directly to the reader's buffer.
+    /// If the producer is not immediately ready the rendezvous completes in
+    /// the background and the live party observes `BLOCKED`.
+    fn forward_produce<T: 'static>(
+        store: StoreContextMut<T>,
+        fwd: &ForwardState,
+        produce: PollStream,
+        try_into: TryInto,
+        read_state: ReadState,
+        live: ForwardParty,
+    ) -> Result<(ReturnCode, bool)> {
+        let &ReadState::GuestReady {
+            ty,
+            caller_instance,
+            caller_thread,
+            flat_abi,
+            instance,
+            options,
+            address,
+            count,
+            handle,
+        } = &read_state
+        else {
+            bail_bug!("expected `ReadState::GuestReady`; got `{read_state:?}`");
+        };
+
+        let budget = fwd.count.sub(fwd.forwarded)?;
+        let state = store.0.concurrent_state_mut()?;
+        let src_tx = state.get_mut(fwd.src)?;
+        match &src_tx.read {
+            ReadState::Open | ReadState::Forwarding(_) => {}
+            state => bail_bug!("unexpected source read state: {state:?}"),
+        }
+        src_tx.read = ReadState::GuestReady {
+            ty,
+            caller_instance,
+            caller_thread,
+            flat_abi,
+            instance,
+            options,
+            address,
+            count: count.min(budget),
+            handle,
+        };
+        let dst_tx = state.get_mut(fwd.dst)?;
+        match &dst_tx.write {
+            WriteState::Open | WriteState::Forwarding(_) => {}
+            state => bail_bug!("unexpected destination write state: {state:?}"),
+        }
+        dst_tx.write = WriteState::Forwarding(*fwd);
+
+        let mut future = produce();
+        state.get_mut(fwd.src)?.write = WriteState::HostReady {
+            produce,
+            try_into,
+            guest_offset: ItemCount::ZERO,
+            cancel: false,
+            cancel_waker: None,
+        };
+        let poll = tls::set(store.0, || {
+            future
+                .as_mut()
+                .poll(&mut Context::from_waker(&Waker::noop()))
+        });
+
+        match poll {
+            Poll::Ready(stream_state) => {
+                let transmit = store.0.concurrent_state_mut()?.get_mut(fwd.src)?;
+                let code = settle_host_write(transmit, TransmitKind::Stream, stream_state?)?;
+                transmit.read = ReadState::Open;
+                finish_forward_produce(store.0, fwd, read_state, code, live)
+            }
+            Poll::Pending => {
+                store.0.pipe_forward_to_guest(*fwd, read_state, future);
+                Ok((ReturnCode::Blocked, false))
+            }
+        }
+    }
+
+    /// Rendezvous a guest write on the source of the specified forward with
+    /// the host consumer owning the destination's read end.
+    ///
+    /// `consume` must have been detached from the destination's
+    /// `ReadState::HostReady` and `write_state` (a `WriteState::GuestReady`)
+    /// from the source's write side. The write is grafted onto the
+    /// destination, clamped to the forward's remaining budget, so the
+    /// single-transmit host `consume` machinery can lift items directly from
+    /// the writer's buffer. If the consumer is not immediately ready the
+    /// rendezvous completes in the background and the live party observes
+    /// `BLOCKED`.
+    fn forward_consume<T: 'static>(
+        store: StoreContextMut<T>,
+        fwd: &ForwardState,
+        consume: PollStream,
+        write_state: WriteState,
+        live: ForwardParty,
+    ) -> Result<(ReturnCode, bool)> {
+        let &WriteState::GuestReady {
+            instance,
+            caller,
+            ty,
+            flat_abi,
+            options,
+            address,
+            count,
+            handle,
+        } = &write_state
+        else {
+            bail_bug!("expected `WriteState::GuestReady`; got `{write_state:?}`");
+        };
+
+        let budget = fwd.count.sub(fwd.forwarded)?;
+        let state = store.0.concurrent_state_mut()?;
+        let src_tx = state.get_mut(fwd.src)?;
+        match &src_tx.read {
+            ReadState::Open | ReadState::Forwarding(_) => {}
+            state => bail_bug!("unexpected source read state: {state:?}"),
+        }
+        src_tx.read = ReadState::Forwarding(*fwd);
+        let dst_tx = state.get_mut(fwd.dst)?;
+        match &dst_tx.write {
+            WriteState::Open | WriteState::Forwarding(_) => {}
+            state => bail_bug!("unexpected destination write state: {state:?}"),
+        }
+        dst_tx.write = WriteState::GuestReady {
+            instance,
+            caller,
+            ty,
+            flat_abi,
+            options,
+            address,
+            count: count.min(budget),
+            handle,
+        };
+
+        let mut future = consume();
+        state.get_mut(fwd.dst)?.read = ReadState::HostReady {
+            consume,
+            guest_offset: ItemCount::ZERO,
+            cancel: false,
+            cancel_waker: None,
+        };
+        let poll = tls::set(store.0, || {
+            future
+                .as_mut()
+                .poll(&mut Context::from_waker(&Waker::noop()))
+        });
+
+        match poll {
+            Poll::Ready(stream_state) => {
+                let transmit = store.0.concurrent_state_mut()?.get_mut(fwd.dst)?;
+                let code = settle_host_read(transmit, TransmitKind::Stream, stream_state?)?;
+                transmit.write = WriteState::Open;
+                finish_forward_consume(store.0, fwd, write_state, code, live)
+            }
+            Poll::Pending => {
+                store.0.pipe_forward_from_guest(*fwd, write_state, future);
+                Ok((ReturnCode::Blocked, false))
+            }
+        }
+    }
+
     fn check_bounds(
         self,
         store: &StoreOpaque,
@@ -4059,6 +4643,52 @@ impl Instance {
                     } else {
                         set_guest_ready(concurrent_state)?;
                         ReturnCode::Blocked
+                    }
+                } else if matches!(&dst_tx.read, ReadState::HostReady { .. }) {
+                    if fwd.forwarded == fwd.count {
+                        // A zero-budget forward is a readiness probe which the
+                        // host consumer and this write jointly satisfy; settle
+                        // the forward, then park the write normally.
+                        finish_forward(
+                            store.0,
+                            &fwd,
+                            ReturnCode::Completed(fwd.count),
+                            false,
+                            false,
+                        )?;
+                        set_guest_ready(store.0.concurrent_state_mut()?)?;
+                        ReturnCode::Blocked
+                    } else {
+                        let ReadState::HostReady {
+                            consume,
+                            guest_offset,
+                            cancel,
+                            cancel_waker,
+                        } = mem::replace(&mut dst_tx.read, ReadState::Open)
+                        else {
+                            unreachable!()
+                        };
+                        if cancel_waker.is_some() || cancel || guest_offset != 0 {
+                            bail_bug!("unexpected consumer state");
+                        }
+                        let write_state = WriteState::GuestReady {
+                            instance: self,
+                            caller,
+                            ty,
+                            flat_abi,
+                            options,
+                            address,
+                            count,
+                            handle,
+                        };
+                        let (code, _) = Instance::forward_consume(
+                            store.as_context_mut(),
+                            &fwd,
+                            consume,
+                            write_state,
+                            ForwardParty::Peer,
+                        )?;
+                        code
                     }
                 } else {
                     match &dst_tx.read {
@@ -4342,6 +4972,55 @@ impl Instance {
                         set_guest_ready(concurrent_state)?;
                         ReturnCode::Blocked
                     }
+                } else if matches!(&src_tx.write, WriteState::HostReady { .. }) {
+                    if fwd.forwarded == fwd.count {
+                        // A zero-budget forward is a readiness probe which the
+                        // host producer and this read jointly satisfy; settle
+                        // the forward, then park the read normally.
+                        finish_forward(
+                            store.0,
+                            &fwd,
+                            ReturnCode::Completed(fwd.count),
+                            false,
+                            false,
+                        )?;
+                        set_guest_ready(store.0.concurrent_state_mut()?)?;
+                        ReturnCode::Blocked
+                    } else {
+                        let WriteState::HostReady {
+                            produce,
+                            try_into,
+                            guest_offset,
+                            cancel,
+                            cancel_waker,
+                        } = mem::replace(&mut src_tx.write, WriteState::Open)
+                        else {
+                            unreachable!()
+                        };
+                        if cancel_waker.is_some() || cancel || guest_offset != 0 {
+                            bail_bug!("unexpected producer state");
+                        }
+                        let read_state = ReadState::GuestReady {
+                            ty,
+                            flat_abi,
+                            options,
+                            address,
+                            count,
+                            handle,
+                            instance: self,
+                            caller_instance,
+                            caller_thread,
+                        };
+                        let (code, _) = Instance::forward_produce(
+                            store.as_context_mut(),
+                            &fwd,
+                            produce,
+                            try_into,
+                            read_state,
+                            ForwardParty::Peer,
+                        )?;
+                        code
+                    }
                 } else {
                     match &src_tx.write {
                         WriteState::Open => {}
@@ -4490,6 +5169,8 @@ impl Instance {
             Open,
             /// A guest operation is parked on this side, ready to rendezvous.
             Ready,
+            /// This side is owned by the host, which is ready to rendezvous.
+            Host,
             /// This side's peer end has been dropped.
             Dropped,
         }
@@ -4498,14 +5179,9 @@ impl Instance {
         if src_tx.done {
             bail!("cannot forward from stream after previous read succeeded");
         }
-        if matches!(src_tx.origin, TransmitOrigin::Host) {
-            bail!("stream.forward involving host-owned streams is not yet supported");
-        }
         let src_peer = match &src_tx.write {
             WriteState::Forwarding(_) => bail!("chained `stream.forward` is not supported"),
-            WriteState::HostReady { .. } => {
-                bail!("stream.forward involving host-owned streams is not yet supported")
-            }
+            WriteState::HostReady { .. } => PeerState::Host,
             WriteState::Open => PeerState::Open,
             WriteState::GuestReady { .. } => PeerState::Ready,
             WriteState::Dropped => PeerState::Dropped,
@@ -4517,32 +5193,30 @@ impl Instance {
                 "cannot forward to stream after previous write succeeded or readable end dropped"
             );
         }
-        if matches!(dst_tx.origin, TransmitOrigin::Host) {
-            bail!("stream.forward involving host-owned streams is not yet supported");
-        }
         let dst_read_handle = dst_tx.read_handle;
         let dst_peer = match &dst_tx.read {
             ReadState::Forwarding(_) => bail!("chained `stream.forward` is not supported"),
-            ReadState::HostReady { .. } | ReadState::HostToHost { .. } => {
-                bail!("stream.forward involving host-owned streams is not yet supported")
-            }
+            ReadState::HostToHost { .. } => bail_bug!("unexpected `ReadState::HostToHost`"),
+            ReadState::HostReady { .. } => PeerState::Host,
             ReadState::Open => PeerState::Open,
             ReadState::GuestReady { .. } => PeerState::Ready,
             ReadState::Dropped => PeerState::Dropped,
         };
 
-        // A guest-created destination stream whose readable end has been
-        // transferred to the host has no guest handle for its read end, so
-        // the host check above cannot see it; reject such forwards here,
-        // before the host attaches a consumer.
-        if matches!(dst_peer, PeerState::Open)
+        // A destination whose readable end has been transferred to the host
+        // without a consumer attached yet is treated like `Open`: if a
+        // consumer is attached while the forward is pending, `set_consumer`
+        // performs the rendezvous. Forwarding between two host-owned ends is
+        // unsupported, however, so reject that combination eagerly.
+        if matches!(src_peer, PeerState::Host)
+            && matches!(dst_peer, PeerState::Open)
             && concurrent_state
                 .get_mut(dst_read_handle)?
                 .common
                 .handle
                 .is_none()
         {
-            bail!("stream.forward involving host-owned streams is not yet supported");
+            bail!("cannot `stream.forward` between two host-owned stream ends");
         }
 
         let fwd = ForwardState {
@@ -4554,6 +5228,8 @@ impl Instance {
             forwarded: ItemCount::ZERO,
             src_handle: src,
             dst_handle: dst,
+            cancel_forward: false,
+            cancel_peer: false,
         };
 
         let mut src_done = false;
@@ -4598,6 +5274,74 @@ impl Instance {
                             ..fwd
                         })?;
                     ReturnCode::Blocked
+                }
+            }
+            (PeerState::Host, PeerState::Host) => {
+                bail!("cannot `stream.forward` between two host-owned stream ends")
+            }
+            (PeerState::Host, PeerState::Ready) => {
+                if count == 0 {
+                    // A zero-length forward is a readiness probe, which the
+                    // host producer and the parked read jointly satisfy
+                    // without consuming either.
+                    ReturnCode::Completed(ItemCount::ZERO)
+                } else {
+                    let src_tx = concurrent_state.get_mut(src_tx_id)?;
+                    let WriteState::HostReady {
+                        produce,
+                        try_into,
+                        guest_offset,
+                        cancel,
+                        cancel_waker,
+                    } = mem::replace(&mut src_tx.write, WriteState::Open)
+                    else {
+                        unreachable!()
+                    };
+                    if cancel_waker.is_some() || cancel || guest_offset != 0 {
+                        bail_bug!("unexpected producer state");
+                    }
+                    let dst_tx = concurrent_state.get_mut(dst_tx_id)?;
+                    let read_state = mem::replace(&mut dst_tx.read, ReadState::Open);
+                    let (code, done) = Instance::forward_produce(
+                        store.as_context_mut(),
+                        &fwd,
+                        produce,
+                        try_into,
+                        read_state,
+                        ForwardParty::Forward,
+                    )?;
+                    src_done = done;
+                    code
+                }
+            }
+            (PeerState::Ready, PeerState::Host) => {
+                if count == 0 {
+                    ReturnCode::Completed(ItemCount::ZERO)
+                } else {
+                    let dst_tx = concurrent_state.get_mut(dst_tx_id)?;
+                    let ReadState::HostReady {
+                        consume,
+                        guest_offset,
+                        cancel,
+                        cancel_waker,
+                    } = mem::replace(&mut dst_tx.read, ReadState::Open)
+                    else {
+                        unreachable!()
+                    };
+                    if cancel_waker.is_some() || cancel || guest_offset != 0 {
+                        bail_bug!("unexpected consumer state");
+                    }
+                    let src_tx = concurrent_state.get_mut(src_tx_id)?;
+                    let write_state = mem::replace(&mut src_tx.write, WriteState::Open);
+                    let (code, done) = Instance::forward_consume(
+                        store.as_context_mut(),
+                        &fwd,
+                        consume,
+                        write_state,
+                        ForwardParty::Forward,
+                    )?;
+                    dst_done = done;
+                    code
                 }
             }
             (PeerState::Open, _) | (_, PeerState::Open) => {
@@ -4698,11 +5442,26 @@ impl Instance {
                 (ReturnCode::Dropped(_) | ReturnCode::Completed(_), _) => code,
                 _ => bail_bug!("unexpected code/event combo"),
             }
+        } else if let Some(fwd) = store.forward_consume_graft(transmit_id)? {
+            // The forwarding guest is cancelling via the destination handle of
+            // a forward whose host-consume rendezvous is in flight; route the
+            // request to the consumer and answer with the forward's terminal
+            // event.
+            store.request_forward_cancel(&fwd, true)?;
+            if async_ {
+                ReturnCode::Blocked
+            } else {
+                let handle = store
+                    .concurrent_state_mut()?
+                    .get_mut(transmit_id)?
+                    .write_handle;
+                self.wait_for_write(store, handle)?
+            }
         } else if let ReadState::HostReady {
             cancel,
             cancel_waker,
             ..
-        } = &mut state.get_mut(transmit_id)?.read
+        } = &mut store.concurrent_state_mut()?.get_mut(transmit_id)?.read
         {
             *cancel = true;
             if let Some(waker) = cancel_waker.take() {
@@ -4722,11 +5481,56 @@ impl Instance {
             &store.concurrent_state_mut()?.get_mut(transmit_id)?.write
         {
             let fwd = *fwd;
-            store
-                .concurrent_state_mut()?
-                .clear_forward(fwd.src, fwd.dst)?;
-            restore_forward_src(store, &fwd, false)?;
-            ReturnCode::Cancelled(fwd.forwarded)
+            let src_tx = store.concurrent_state_mut()?.get_mut(fwd.src)?;
+            if matches!(&src_tx.write, WriteState::HostReady { .. })
+                && matches!(&src_tx.read, ReadState::GuestReady { .. })
+            {
+                // A host-produce rendezvous is in flight for this forward;
+                // route the request to the producer and answer with the
+                // forward's terminal event.
+                store.request_forward_cancel(&fwd, true)?;
+                if async_ {
+                    ReturnCode::Blocked
+                } else {
+                    let handle = store
+                        .concurrent_state_mut()?
+                        .get_mut(transmit_id)?
+                        .write_handle;
+                    self.wait_for_write(store, handle)?
+                }
+            } else {
+                store
+                    .concurrent_state_mut()?
+                    .clear_forward(fwd.src, fwd.dst)?;
+                restore_forward_src(store, &fwd, false)?;
+                ReturnCode::Cancelled(fwd.forwarded)
+            }
+        } else if let ReadState::Forwarding(fwd) =
+            &store.concurrent_state_mut()?.get_mut(transmit_id)?.read
+        {
+            // This transmit is the source of a pending forward, making the
+            // caller the source's writer.
+            let fwd = *fwd;
+            if matches!(
+                &store.concurrent_state_mut()?.get_mut(fwd.dst)?.write,
+                WriteState::GuestReady { .. }
+            ) {
+                // The writer's own parked write is grafted into an in-flight
+                // host-consume rendezvous; route the request to the consumer
+                // and answer with the write's completion event.
+                store.request_forward_cancel(&fwd, false)?;
+                if async_ {
+                    ReturnCode::Blocked
+                } else {
+                    let handle = store
+                        .concurrent_state_mut()?
+                        .get_mut(transmit_id)?
+                        .write_handle;
+                    self.wait_for_write(store, handle)?
+                }
+            } else {
+                ReturnCode::Cancelled(ItemCount::ZERO)
+            }
         } else {
             ReturnCode::Cancelled(ItemCount::ZERO)
         };
@@ -4802,11 +5606,23 @@ impl Instance {
                 (ReturnCode::Dropped(_) | ReturnCode::Completed(_), _) => code,
                 _ => bail_bug!("unexpected code/event combo"),
             }
+        } else if let Some(fwd) = store.forward_produce_graft(transmit_id)? {
+            // The forwarding guest is cancelling via the source handle of a
+            // forward whose host-produce rendezvous is in flight; route the
+            // request to the producer and answer with the forward's terminal
+            // event.
+            store.request_forward_cancel(&fwd, true)?;
+            if async_ {
+                ReturnCode::Blocked
+            } else {
+                let handle = store.concurrent_state_mut()?.get_mut(fwd.dst)?.write_handle;
+                self.wait_for_write(store, handle)?
+            }
         } else if let WriteState::HostReady {
             cancel,
             cancel_waker,
             ..
-        } = &mut state.get_mut(transmit_id)?.write
+        } = &mut store.concurrent_state_mut()?.get_mut(transmit_id)?.write
         {
             *cancel = true;
             if let Some(waker) = cancel_waker.take() {
@@ -4825,17 +5641,60 @@ impl Instance {
         } else if let ReadState::Forwarding(fwd) =
             &store.concurrent_state_mut()?.get_mut(transmit_id)?.read
         {
-            // Cancelling via the source handle of a pending forward tears the
-            // forward down just like `cancel_write` via the destination
-            // handle: no event will be delivered for it, so restore the
-            // destination handle entry here; the caller restores the source
-            // handle entry.
             let fwd = *fwd;
-            store
-                .concurrent_state_mut()?
-                .clear_forward(fwd.src, fwd.dst)?;
-            restore_forward_dst(store, &fwd)?;
-            ReturnCode::Cancelled(fwd.forwarded)
+            if matches!(
+                &store.concurrent_state_mut()?.get_mut(fwd.dst)?.write,
+                WriteState::GuestReady { .. }
+            ) {
+                // The forwarding guest is cancelling via the source handle of
+                // a forward whose host-consume rendezvous is in flight; route
+                // the request to the consumer and answer with the forward's
+                // terminal event.
+                store.request_forward_cancel(&fwd, true)?;
+                if async_ {
+                    ReturnCode::Blocked
+                } else {
+                    let handle = store.concurrent_state_mut()?.get_mut(fwd.dst)?.write_handle;
+                    self.wait_for_write(store, handle)?
+                }
+            } else {
+                // Cancelling via the source handle of a pending forward tears
+                // the forward down just like `cancel_write` via the
+                // destination handle: no event will be delivered for it, so
+                // restore the destination handle entry here; the caller
+                // restores the source handle entry.
+                store
+                    .concurrent_state_mut()?
+                    .clear_forward(fwd.src, fwd.dst)?;
+                restore_forward_dst(store, &fwd)?;
+                ReturnCode::Cancelled(fwd.forwarded)
+            }
+        } else if let WriteState::Forwarding(fwd) =
+            &store.concurrent_state_mut()?.get_mut(transmit_id)?.write
+        {
+            // This transmit is the destination of a pending forward, making
+            // the caller the destination's reader.
+            let fwd = *fwd;
+            let src_tx = store.concurrent_state_mut()?.get_mut(fwd.src)?;
+            if matches!(&src_tx.write, WriteState::HostReady { .. })
+                && matches!(&src_tx.read, ReadState::GuestReady { .. })
+            {
+                // The reader's own parked read is grafted into an in-flight
+                // host-produce rendezvous; route the request to the producer
+                // and answer with the read's completion event.
+                store.request_forward_cancel(&fwd, false)?;
+                if async_ {
+                    ReturnCode::Blocked
+                } else {
+                    let handle = store
+                        .concurrent_state_mut()?
+                        .get_mut(transmit_id)?
+                        .read_handle;
+                    self.wait_for_read(store, handle)?
+                }
+            } else {
+                ReturnCode::Cancelled(ItemCount::ZERO)
+            }
         } else {
             ReturnCode::Cancelled(ItemCount::ZERO)
         };
