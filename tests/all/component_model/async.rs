@@ -1182,3 +1182,146 @@ fn inter_component_stream_is_not_intra_component() -> Result<()> {
 
     Ok(())
 }
+
+/// Transferring the readable end of a `stream.forward` destination to the
+/// host is rejected at lift time rather than leaving the host with a
+/// `StreamReader` it can never use.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn stream_forward_dst_readable_end_cannot_be_lifted() -> Result<()> {
+    let mut config = Config::new();
+    config.wasm_component_model_async(true);
+    config.wasm_component_model_more_async_builtins(true);
+    let engine = Engine::new(&config)?;
+
+    let component = Component::new(
+        &engine,
+        r#"
+(component
+  (type $s (stream u8))
+  (core func $stream.new (canon stream.new $s))
+  (core func $stream.forward (canon stream.forward $s async))
+
+  (core module $m
+    (import "" "stream.new" (func $stream.new (result i64)))
+    (import "" "stream.forward" (func $stream.forward (param i32 i32 i32) (result i32)))
+
+    (func (export "mk") (result i32)
+      (local $t64 i64)
+      (local $r.src i32)
+      (local $r.dst i32)
+      (local $w.dst i32)
+
+      (local.set $t64 (call $stream.new))
+      (local.set $r.src (i32.wrap_i64 (local.get $t64)))
+
+      (local.set $t64 (call $stream.new))
+      (local.set $r.dst (i32.wrap_i64 (local.get $t64)))
+      (local.set $w.dst (i32.wrap_i64 (i64.shr_u (local.get $t64) (i64.const 32))))
+
+      (if (i32.ne (call $stream.forward (local.get $r.src) (local.get $w.dst) (i32.const 4))
+                  (i32.const -1 (; BLOCKED ;)))
+        (then unreachable))
+
+      (local.get $r.dst)
+    )
+  )
+
+  (core instance $i (instantiate $m
+    (with "" (instance
+      (export "stream.new" (func $stream.new))
+      (export "stream.forward" (func $stream.forward))
+    ))
+  ))
+
+  (func (export "mk") (result $s) (canon lift (core func $i "mk")))
+)
+        "#,
+    )?;
+
+    let mut store = Store::new(&engine, ());
+    let instance = Linker::new(&engine).instantiate(&mut store, &component)?;
+    let mk = instance.get_typed_func::<(), (StreamReader<u8>,)>(&mut store, "mk")?;
+
+    let error = format!("{:?}", mk.call(&mut store, ()).unwrap_err());
+    assert!(
+        error.contains("cannot transfer the read end of a stream with a pending `stream.forward` to the host"),
+        "unexpected error: {error}"
+    );
+
+    Ok(())
+}
+
+/// A `stream.forward` whose destination's readable end is already owned by
+/// the host (but idle) is rejected at registration, before the host's later
+/// read could observe a half-registered forward.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn stream_forward_rejects_host_owned_dst_readable_end() -> Result<()> {
+    let mut config = Config::new();
+    config.wasm_component_model_async(true);
+    config.wasm_component_model_more_async_builtins(true);
+    let engine = Engine::new(&config)?;
+
+    let component = Component::new(
+        &engine,
+        r#"
+(component
+  (type $s (stream u8))
+  (core func $stream.new (canon stream.new $s))
+  (core func $stream.forward (canon stream.forward $s async))
+
+  (core module $m
+    (import "" "stream.new" (func $stream.new (result i64)))
+    (import "" "stream.forward" (func $stream.forward (param i32 i32 i32) (result i32)))
+
+    (global $w.dst (mut i32) (i32.const 0))
+
+    (func (export "mk") (result i32)
+      (local $t64 i64)
+      (local.set $t64 (call $stream.new))
+      (global.set $w.dst (i32.wrap_i64 (i64.shr_u (local.get $t64) (i64.const 32))))
+      (i32.wrap_i64 (local.get $t64))
+    )
+
+    (func (export "fwd") (result i32)
+      (local $t64 i64)
+      (local $r.src i32)
+
+      (local.set $t64 (call $stream.new))
+      (local.set $r.src (i32.wrap_i64 (local.get $t64)))
+
+      (call $stream.forward (local.get $r.src) (global.get $w.dst) (i32.const 4))
+    )
+  )
+
+  (core instance $i (instantiate $m
+    (with "" (instance
+      (export "stream.new" (func $stream.new))
+      (export "stream.forward" (func $stream.forward))
+    ))
+  ))
+
+  (func (export "mk") (result $s) (canon lift (core func $i "mk")))
+  (func (export "fwd") (result u32) (canon lift (core func $i "fwd")))
+)
+        "#,
+    )?;
+
+    let mut store = Store::new(&engine, ());
+    let instance = Linker::new(&engine).instantiate(&mut store, &component)?;
+    let mk = instance.get_typed_func::<(), (StreamReader<u8>,)>(&mut store, "mk")?;
+    let fwd = instance.get_typed_func::<(), (u32,)>(&mut store, "fwd")?;
+
+    // Take ownership of the destination's readable end on the host side,
+    // but don't attach a consumer to it.
+    let (_reader,) = mk.call(&mut store, ())?;
+
+    let error = format!("{:?}", fwd.call(&mut store, ()).unwrap_err());
+    assert!(
+        error.contains("stream.forward involving host-owned streams is not yet supported"),
+        "unexpected error: {error}"
+    );
+
+    Ok(())
+}

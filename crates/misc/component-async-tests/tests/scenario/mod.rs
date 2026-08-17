@@ -3,6 +3,7 @@ mod util;
 pub mod backpressure;
 pub mod borrowing;
 pub mod error_context;
+pub mod forward;
 pub mod post_return;
 pub mod read_resource_stream;
 pub mod round_trip;

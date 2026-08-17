@@ -160,6 +160,11 @@ enum Event {
         code: ReturnCode,
         pending: Option<(TypeStreamTableIndex, u32)>,
     },
+    StreamForward {
+        code: ReturnCode,
+        pending: Option<(TypeStreamTableIndex, u32)>,
+        dst_dropped: bool,
+    },
     FutureRead {
         code: ReturnCode,
         pending: Option<(TypeFutureTableIndex, u32)>,
@@ -184,12 +189,14 @@ impl Event {
         const EVENT_FUTURE_READ: u32 = 4;
         const EVENT_FUTURE_WRITE: u32 = 5;
         const EVENT_CANCELLED: u32 = 6;
+        const EVENT_STREAM_FORWARD: u32 = 7;
         match self {
             Event::None => (EVENT_NONE, 0),
             Event::Cancelled => (EVENT_CANCELLED, 0),
             Event::Subtask { status } => (EVENT_SUBTASK, status as u32),
             Event::StreamRead { code, .. } => (EVENT_STREAM_READ, code.encode()),
             Event::StreamWrite { code, .. } => (EVENT_STREAM_WRITE, code.encode()),
+            Event::StreamForward { code, .. } => (EVENT_STREAM_FORWARD, code.encode()),
             Event::FutureRead { code, .. } => (EVENT_FUTURE_READ, code.encode()),
             Event::FutureWrite { code, .. } => (EVENT_FUTURE_WRITE, code.encode()),
         }
@@ -4515,14 +4522,7 @@ impl<T: 'static> VMComponentAsyncStore for StoreInner<T> {
         count: u32,
     ) -> Result<u32> {
         instance
-            .guest_forward(
-                StoreContextMut(self),
-                TransmitIndex::Stream(ty),
-                async_,
-                reader,
-                writer,
-                count,
-            )
+            .guest_forward(StoreContextMut(self), ty, async_, reader, writer, count)
             .map(|result| result.encode())
     }
 
