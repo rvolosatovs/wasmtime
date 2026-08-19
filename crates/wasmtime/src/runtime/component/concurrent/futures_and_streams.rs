@@ -2247,6 +2247,24 @@ enum ForwardEnd {
     Dst,
 }
 
+impl ForwardEnd {
+    fn other(self) -> Self {
+        match self {
+            Self::Src => Self::Dst,
+            Self::Dst => Self::Src,
+        }
+    }
+}
+
+impl From<ForwardEnd> for ForwardCancelVia {
+    fn from(end: ForwardEnd) -> Self {
+        match end {
+            ForwardEnd::Src => Self::Src,
+            ForwardEnd::Dst => Self::Dst,
+        }
+    }
+}
+
 /// Records which of the forwarding guest's handles have requested
 /// cancellation of an in-flight host rendezvous; the forward's terminal
 /// event is delivered on each requesting end's waitable.
@@ -2530,17 +2548,18 @@ fn settle_forward_rendezvous(
         cancel_peer: false,
         ..*fwd
     };
-    let (forward_code, done) = if cancel_forward.requested() {
-        (ReturnCode::Cancelled(forwarded), false)
+    let dropped = matches!(code, ReturnCode::Dropped(_));
+    let (forward_code, done) = if forwarded == fwd.count {
+        // The forward's budget is exhausted, so it completes even if this
+        // batch also resolved a cancellation request or reported the host end
+        // terminal; the done flag on the forwarding guest's handle records the
+        // latter. A cancellation only takes effect on a forward that still had
+        // budget left when the batch settled it.
+        (ReturnCode::Completed(fwd.count), dropped)
+    } else if cancel_forward.requested() {
+        (ReturnCode::Cancelled(forwarded), dropped)
     } else {
         match code {
-            // The forward's budget is exhausted, so it completes even if this
-            // batch also reported the host end terminal; the done flag on the
-            // forwarding guest's handle records the latter.
-            _ if forwarded == fwd.count => (
-                ReturnCode::Completed(fwd.count),
-                matches!(code, ReturnCode::Dropped(_)),
-            ),
             ReturnCode::Completed(_) | ReturnCode::Cancelled(_) => {
                 store.concurrent_state_mut()?.register_forward(fwd)?;
                 let code = match live {
@@ -2567,9 +2586,9 @@ fn settle_forward_rendezvous(
                 state.clear_forward(fwd.src, fwd.dst)?;
                 let src_event = state.get_mut(fwd.src)?.read_handle.rep();
                 let dst_event = state.get_mut(fwd.dst)?.write_handle.rep();
-                for (event_handle, pending_handle, src) in [
-                    (src_event, fwd.src_handle, true),
-                    (dst_event, fwd.dst_handle, false),
+                for (event_handle, pending_handle, end) in [
+                    (src_event, fwd.src_handle, ForwardEnd::Src),
+                    (dst_event, fwd.dst_handle, ForwardEnd::Dst),
                 ] {
                     if state.take_event(event_handle)?.is_some() {
                         bail_bug!(
@@ -2581,13 +2600,19 @@ fn settle_forward_rendezvous(
                         Event::StreamForward {
                             code: forward_code,
                             pending: Some((fwd.ty, pending_handle)),
-                            src,
-                            dropped: false,
+                            src: end == ForwardEnd::Src,
+                            dropped: done && end == host_end,
                         },
                     )?;
                 }
             }
-            ForwardCancel::Src => finish_forward(store, &fwd, forward_code, ForwardEnd::Src, None)?,
+            ForwardCancel::Src => finish_forward(
+                store,
+                &fwd,
+                forward_code,
+                ForwardEnd::Src,
+                done.then_some(host_end),
+            )?,
             ForwardCancel::None | ForwardCancel::Dst => finish_forward(
                 store,
                 &fwd,
@@ -3014,6 +3039,41 @@ impl StoreOpaque {
             &ReadState::Forwarding(fwd) if fwd.dst == id => Ok(Some(fwd)),
             state => bail_bug!("expected `ReadState::Forwarding`; got `{state:?}`"),
         }
+    }
+
+    /// Whether a guest thread is currently blocked awaiting an event on the
+    /// specified end's waitable, i.e. it is sync-blocked in `stream.forward`
+    /// or parked on a waitable set that end was joined to.
+    ///
+    /// Mere set membership is not enough: a guest may join a handle to a set
+    /// it only polls, and tearing a forward down owes an event to a thread
+    /// that would otherwise never be woken, not to every watcher.
+    fn forward_end_has_waiter(&mut self, fwd: &ForwardState, end: ForwardEnd) -> Result<bool> {
+        let state = self.concurrent_state_mut()?;
+        let handle = match end {
+            ForwardEnd::Src => state.get_mut(fwd.src)?.read_handle,
+            ForwardEnd::Dst => state.get_mut(fwd.dst)?.write_handle,
+        };
+        let Some(set) = Waitable::Transmit(handle).common(state)?.set else {
+            return Ok(false);
+        };
+        Ok(!state.get_mut(set)?.waiting.is_empty())
+    }
+
+    /// Request cancellation of the host rendezvous in flight for the specified
+    /// forward on behalf of the forwarding guest's `via` handle, additionally
+    /// recording the opposite end when a task is waiting there for the
+    /// forward's terminal event.
+    ///
+    /// A forward has a single terminal event, so routing it to the requesting
+    /// end alone would strand such a waiter and release its handle from under
+    /// it; recording both ends gives each its own event instead.
+    fn request_forward_cancel_for(&mut self, fwd: &ForwardState, via: ForwardEnd) -> Result<()> {
+        let other = via.other();
+        if self.forward_end_has_waiter(fwd, other)? {
+            self.request_forward_cancel(fwd, other.into())?;
+        }
+        self.request_forward_cancel(fwd, via.into())
     }
 
     /// Request cancellation of the host rendezvous currently in flight for the
@@ -5567,7 +5627,7 @@ impl Instance {
             // a forward whose host-consume rendezvous is in flight; route the
             // request to the consumer and answer with the forward's terminal
             // event.
-            store.request_forward_cancel(&fwd, ForwardCancelVia::Dst)?;
+            store.request_forward_cancel_for(&fwd, ForwardEnd::Dst)?;
             self.block_or_wait_for_write(store, transmit_id, async_)?
         } else if let WriteState::Forwarding(fwd) =
             &store.concurrent_state_mut()?.get_mut(transmit_id)?.write
@@ -5577,15 +5637,11 @@ impl Instance {
                 // A host-produce rendezvous is in flight for this forward;
                 // route the request to the producer and answer with the
                 // forward's terminal event.
-                store.request_forward_cancel(&fwd, ForwardCancelVia::Dst)?;
+                store.request_forward_cancel_for(&fwd, ForwardEnd::Dst)?;
                 self.block_or_wait_for_write(store, transmit_id, async_)?
-            } else if waitable
-                .common(store.concurrent_state_mut()?)?
-                .set
-                .is_some()
-            {
-                // Another task is waiting on this handle's waitable for the
-                // forward's terminal event (e.g. it is sync-blocked in
+            } else if store.forward_end_has_waiter(&fwd, ForwardEnd::Dst)? {
+                // Another task is blocked on this handle's waitable awaiting
+                // the forward's terminal event (e.g. it is sync-blocked in
                 // `stream.forward`): tearing the forward down without an
                 // event would strand it, so deliver the cancellation as that
                 // event instead. Only an async cancel can get here (a sync
@@ -5742,7 +5798,7 @@ impl Instance {
             // forward whose host-produce rendezvous is in flight; route the
             // request to the producer and answer with the forward's terminal
             // event, delivered on this source handle.
-            store.request_forward_cancel(&fwd, ForwardCancelVia::Src)?;
+            store.request_forward_cancel_for(&fwd, ForwardEnd::Src)?;
             self.block_or_wait_for_read(store, transmit_id, async_)?
         } else if let ReadState::Forwarding(fwd) =
             &store.concurrent_state_mut()?.get_mut(transmit_id)?.read
@@ -5753,25 +5809,20 @@ impl Instance {
                 // a forward whose host-consume rendezvous is in flight; route
                 // the request to the consumer and answer with the forward's
                 // terminal event, delivered on this source handle.
-                store.request_forward_cancel(&fwd, ForwardCancelVia::Src)?;
+                store.request_forward_cancel_for(&fwd, ForwardEnd::Src)?;
                 self.block_or_wait_for_read(store, transmit_id, async_)?
             } else {
                 // Cancelling via the source handle of a pending forward tears
                 // the forward down just like `cancel_write` via the
-                // destination handle. If another task is waiting on the
-                // destination's write-handle waitable for the forward's
+                // destination handle. If another task is blocked on the
+                // destination's write-handle waitable awaiting the forward's
                 // terminal event (e.g. it is sync-blocked in
                 // `stream.forward`), deliver the cancellation as that event;
                 // otherwise no event is delivered, so restore the destination
                 // handle entry here. Either way the caller restores the
                 // source handle entry (`finish_forward` restores it eagerly
                 // in the former case).
-                let write_handle = store.concurrent_state_mut()?.get_mut(fwd.dst)?.write_handle;
-                if Waitable::Transmit(write_handle)
-                    .common(store.concurrent_state_mut()?)?
-                    .set
-                    .is_some()
-                {
+                if store.forward_end_has_waiter(&fwd, ForwardEnd::Dst)? {
                     finish_forward(
                         store,
                         &fwd,

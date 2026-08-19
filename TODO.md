@@ -18,15 +18,21 @@ against `bc06450a02`. Delete this file before the branch is proposed upstream.
 
 ## Cancellation bugs
 
-The first four share a root cause: the code asks "is another task sync-blocked in
+The first four shared a root cause: the code asked "is another task sync-blocked in
 `stream.forward` on this handle?" by testing `waitable.common(..).set.is_some()`.
-Waitable-set membership is not that fact — a guest can join a handle to a set with
-`waitable-set.add` purely to poll it, and set-joining is an incidental detail of
-how `wait_for_event` parks sync waiters. Fixing the four sites individually is
-worthwhile, but the durable fix is to record on the forward itself whether a
-terminal delivery is owed and to which end.
+Waitable-set membership is not that fact — a guest can join a handle to a set purely
+to poll it, and set-joining is an incidental detail of how `wait_for_event` parks
+sync waiters.
 
-- [ ] **`futures_and_streams.rs:2590` — host-graft cancel strands a sync forward.**
+Three of the four are now fixed. `forward_end_has_waiter` replaces the membership
+test with the fact actually wanted: whether a guest thread is currently parked on the
+set that end was joined to (`WaitableSet::waiting` is non-empty). That is checkable
+today and distinguishes a blocked waiter from an incidental watcher, so it does not
+need the `ForwardState` phase field originally sketched here. Whether to record the
+owed delivery on the forward anyway remains open — see the `ForwardState` cleanup
+below, which would make it fall out for free.
+
+- [x] **`futures_and_streams.rs:2590` — host-graft cancel strands a sync forward.**
   The graft branches call `request_forward_cancel` unconditionally, without the
   `set.is_some()` check the pure-guest teardown branch 20 lines below (5769-5781)
   performs for exactly this hazard. A task sync-blocked in `stream.forward` against
@@ -37,7 +43,12 @@ terminal delivery is owed and to which end.
   and any later event on that waitable makes `Waitable::on_delivery` `bail_bug!`.
   Same gap at 5756 and in the `ForwardCancel::Both` arm.
 
-- [ ] **`futures_and_streams.rs:5788` — `cancel_read` reports `Cancelled` while
+  Fixed: the four graft branches now go through `request_forward_cancel_for`, which
+  records the opposite end as well when a thread is blocked there, so each end gets
+  its own terminal event via the existing `ForwardCancel::Both` path. Covered by
+  `async_cancel_grafted_forward_from_sibling_task`.
+
+- [x] **`futures_and_streams.rs:5788` — `cancel_read` reports `Cancelled` while
   leaving the destination `Busy`.** Both sub-branches of the `ReadState::Forwarding`
   teardown fall through to `ReturnCode::Cancelled(fwd.forwarded)`, but the
   `set.is_some()` branch also queues the terminal event and restores only the source
@@ -49,6 +60,11 @@ terminal delivery is owed and to which end.
   the queued event. Adding the `waitable.join` that is the normal way to observe an
   async forward is what flips the branch, so the same program works without it.
 
+  Fixed as a consequence of the predicate change: a guest that joins the destination
+  without parking on the set now takes the eager-restore path, so the outcome no
+  longer turns on membership. A genuinely blocked waiter still gets its event.
+  Covered by the last case in `stream-forward-cancel.wast`.
+
 - [ ] **`futures_and_streams.rs:5576` — graft cancel waits on a waitable a sync
   forward already owns.** The graft branches reach `block_or_wait_for_*` before the
   `set.is_some()` check on the following `else if`. Exactly one terminal event is
@@ -56,7 +72,14 @@ terminal delivery is owed and to which end.
   the canceller is sync, `wait_for_event` -> `trap_if_in_waitable_set` traps with
   `Trap::WaitableSyncAndAsync`. Symmetric at 5745.
 
-- [ ] **`futures_and_streams.rs:2533` — cancel outranks a completed budget.**
+  Still open, and not covered by a test: here the canceller and the sync-blocked
+  forwarder are parked on the *same* waitable, so the "give each end its own event"
+  fix above does not apply, and a guest cannot join a waitable another task is
+  sync-waiting on, so the starvation has no guest-observable repro. It needs a
+  decision on what an async cancel should promise when the event it would wait for
+  is already owed to someone else — plausibly refuse rather than answer `BLOCKED`.
+
+- [x] **`futures_and_streams.rs:2533` — cancel outranks a completed budget.**
   `settle_forward_rendezvous` tests `cancel_forward.requested()` before the
   `forwarded == fwd.count` arm, so a forward whose full budget lands in the same
   batch that resolves a cancellation reports `CANCELLED(count)` where the rule
@@ -65,6 +88,10 @@ terminal delivery is owed and to which end.
   `restore_forward_end` marks the source `Read { done: false }` even though
   `src.write` is `WriteState::Dropped`. `ForwardCancel::Both` likewise hardcodes
   `dropped: false` on both events.
+
+  Fixed: the budget-exhausted arm is now tested first, and the `done` flag derived
+  from the batch's code flows into all three cancellation arms. Covered by
+  `async_cancel_resolved_by_completing_batch`.
 
 ## Other correctness work
 
@@ -76,6 +103,14 @@ terminal delivery is owed and to which end.
   to decide when to issue the real forward is told both ends are ready and then
   blocks. Five sites define probe semantics independently of `forward_copy`'s
   `budget == 0` rule (4260): 5391, 5423, 4794, 5103, and `set_consumer` 3688.
+
+  Premise confirmed by experiment: with a pending `StreamProducer` attached to the
+  source, `stream.read(r_src, ptr, 0)` reports `BLOCKED` while
+  `stream.forward(r_src, w_dst, 0)` reports `COMPLETED(0)`. Still open: answering
+  honestly means polling the host end on a zero-budget forward and registering the
+  forward so the guest is told when it becomes ready, which is new machinery rather
+  than a local edit. `async_zero_length_forward_probes_host_producer` encodes the
+  wanted behaviour and is `#[ignore]`d until then.
 
 - [ ] **`futures_and_streams.rs:5562` — the `Cancelled` catch-all is too broad.**
   `(ReturnCode::Cancelled(_), _) => code` in `cancel_write` (5562) and `cancel_read`
