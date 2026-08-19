@@ -914,3 +914,96 @@
 )
 
 (assert_trap (invoke "run") "stream or future read cancelled when no read is pending")
+
+;; Cancelling a pending forward via `stream.cancel-read` on the source must
+;; release the destination handle regardless of whether that handle happens
+;; to be joined to a waitable set.  `cancel_read`'s teardown uses waitable-set
+;; membership as a proxy for "a task is waiting for this forward's terminal
+;; event", but a guest may join the destination for unrelated polling; when it
+;; does, the teardown queues an event and leaves the destination `Busy` while
+;; still answering `CANCELLED`, so the guest is told the forward is over and
+;; then cannot drop the destination it was handed back.
+(component
+  (core module $libc (memory (export "m") 1))
+  (core instance $libc (instantiate $libc))
+
+  (type $s (stream u8))
+  (core func $stream.new (canon stream.new $s))
+  (core func $stream.forward (canon stream.forward $s async))
+  (core func $stream.cancel-read (canon stream.cancel-read $s async))
+  (core func $stream.drop-readable (canon stream.drop-readable $s))
+  (core func $stream.drop-writable (canon stream.drop-writable $s))
+  (core func $waitable-set.new (canon waitable-set.new))
+  (core func $waitable-set.drop (canon waitable-set.drop))
+  (core func $waitable.join (canon waitable.join))
+
+  (core module $m
+    (import "" "m" (memory 1))
+    (import "" "stream.new" (func $stream.new (result i64)))
+    (import "" "stream.forward" (func $stream.forward (param i32 i32 i32) (result i32)))
+    (import "" "stream.cancel-read" (func $stream.cancel-read (param i32) (result i32)))
+    (import "" "stream.drop-readable" (func $stream.drop-readable (param i32)))
+    (import "" "stream.drop-writable" (func $stream.drop-writable (param i32)))
+    (import "" "waitable-set.new" (func $waitable-set.new (result i32)))
+    (import "" "waitable-set.drop" (func $waitable-set.drop (param i32)))
+    (import "" "waitable.join" (func $waitable.join (param i32 i32)))
+
+    (func (export "run")
+      (local $t64 i64)
+      (local $r.src i32)
+      (local $w.src i32)
+      (local $r.dst i32)
+      (local $w.dst i32)
+      (local $ws i32)
+
+      (local.set $t64 (call $stream.new))
+      (local.set $r.src (i32.wrap_i64 (local.get $t64)))
+      (local.set $w.src (i32.wrap_i64 (i64.shr_u (local.get $t64) (i64.const 32))))
+
+      (local.set $t64 (call $stream.new))
+      (local.set $r.dst (i32.wrap_i64 (local.get $t64)))
+      (local.set $w.dst (i32.wrap_i64 (i64.shr_u (local.get $t64) (i64.const 32))))
+
+      (if (i32.ne (call $stream.forward (local.get $r.src) (local.get $w.dst) (i32.const 4))
+                  (i32.const -1 (; BLOCKED ;)))
+        (then unreachable))
+
+      ;; Watch the destination.  Nothing here awaits the forward's completion:
+      ;; the set is only polled, which a guest is free to do.
+      (local.set $ws (call $waitable-set.new))
+      (call $waitable.join (local.get $w.dst) (local.get $ws))
+
+      (if (i32.ne (call $stream.cancel-read (local.get $r.src))
+                  (i32.const 0x2 (; CANCELLED ;)))
+        (then unreachable))
+
+      (call $waitable.join (local.get $w.dst) (i32.const 0))
+      (call $waitable-set.drop (local.get $ws))
+
+      ;; `CANCELLED` promised no further event, so both ends are the guest's
+      ;; again and the destination must be droppable.
+      (call $stream.drop-readable (local.get $r.src))
+      (call $stream.drop-writable (local.get $w.src))
+      (call $stream.drop-readable (local.get $r.dst))
+      (call $stream.drop-writable (local.get $w.dst))
+    )
+  )
+
+  (core instance $i (instantiate $m
+    (with "" (instance
+      (export "m" (memory $libc "m"))
+      (export "stream.new" (func $stream.new))
+      (export "stream.forward" (func $stream.forward))
+      (export "stream.cancel-read" (func $stream.cancel-read))
+      (export "stream.drop-readable" (func $stream.drop-readable))
+      (export "stream.drop-writable" (func $stream.drop-writable))
+      (export "waitable-set.new" (func $waitable-set.new))
+      (export "waitable-set.drop" (func $waitable-set.drop))
+      (export "waitable.join" (func $waitable.join))
+    ))
+  ))
+
+  (func (export "run") async (canon lift (core func $i "run")))
+)
+
+(assert_return (invoke "run"))
