@@ -793,16 +793,16 @@ fpr = "fpr"
 extend-exclude = [ "docs/js/mermaid*.js", "crates/wasi-nn/**/*.txt", "*.isle" ]
 
 [patch.crates-io]
-wasmparser = { path = "../wasm-tools/crates/wasmparser" }
-wat = { path = "../wasm-tools/crates/wat" }
-wast = { path = "../wasm-tools/crates/wast" }
-wasmprinter = { path = "../wasm-tools/crates/wasmprinter" }
-wasm-encoder = { path = "../wasm-tools/crates/wasm-encoder" }
-wasm-smith = { path = "../wasm-tools/crates/wasm-smith" }
-wasm-mutate = { path = "../wasm-tools/crates/wasm-mutate" }
-wit-parser = { path = "../wasm-tools/crates/wit-parser" }
-wit-component = { path = "../wasm-tools/crates/wit-component" }
-wasm-wave = { path = "../wasm-tools/crates/wasm-wave" }
-wasm-compose = { path = "../wasm-tools/crates/wasm-compose" }
-wasm-metadata = { path = "../wasm-tools/crates/wasm-metadata" }
-json-from-wast = { path = "../wasm-tools/crates/json-from-wast" }
+wasmparser = { git = "https://github.com/rvolosatovs/wasm-tools", branch = "feat/stream-forward-0.254" }
+wat = { git = "https://github.com/rvolosatovs/wasm-tools", branch = "feat/stream-forward-0.254" }
+wast = { git = "https://github.com/rvolosatovs/wasm-tools", branch = "feat/stream-forward-0.254" }
+wasmprinter = { git = "https://github.com/rvolosatovs/wasm-tools", branch = "feat/stream-forward-0.254" }
+wasm-encoder = { git = "https://github.com/rvolosatovs/wasm-tools", branch = "feat/stream-forward-0.254" }
+wasm-smith = { git = "https://github.com/rvolosatovs/wasm-tools", branch = "feat/stream-forward-0.254" }
+wasm-mutate = { git = "https://github.com/rvolosatovs/wasm-tools", branch = "feat/stream-forward-0.254" }
+wit-parser = { git = "https://github.com/rvolosatovs/wasm-tools", branch = "feat/stream-forward-0.254" }
+wit-component = { git = "https://github.com/rvolosatovs/wasm-tools", branch = "feat/stream-forward-0.254" }
+wasm-wave = { git = "https://github.com/rvolosatovs/wasm-tools", branch = "feat/stream-forward-0.254" }
+wasm-compose = { git = "https://github.com/rvolosatovs/wasm-tools", branch = "feat/stream-forward-0.254" }
+wasm-metadata = { git = "https://github.com/rvolosatovs/wasm-tools", branch = "feat/stream-forward-0.254" }
+json-from-wast = { git = "https://github.com/rvolosatovs/wasm-tools", branch = "feat/stream-forward-0.254" }

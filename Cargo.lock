@@ -2248,6 +2248,7 @@ dependencies = [
 [[package]]
 name = "json-from-wast"
 version = "0.254.0"
+source = "git+https://github.com/rvolosatovs/wasm-tools?branch=feat%2Fstream-forward-0.254#1498f6c61ba2efe316dd996c896c66e4ebb7f04d"
 dependencies = [
  "anyhow",
  "serde",
@@ -3741,7 +3742,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand 2.3.0",
- "getrandom 0.3.1",
+ "getrandom 0.4.2",
  "once_cell",
  "rustix 1.1.4",
  "windows-sys 0.61.2",
@@ -4393,6 +4394,7 @@ dependencies = [
 [[package]]
 name = "wasm-compose"
 version = "0.254.0"
+source = "git+https://github.com/rvolosatovs/wasm-tools?branch=feat%2Fstream-forward-0.254#1498f6c61ba2efe316dd996c896c66e4ebb7f04d"
 dependencies = [
  "anyhow",
  "heck",
@@ -4418,6 +4420,7 @@ dependencies = [
 [[package]]
 name = "wasm-encoder"
 version = "0.254.0"
+source = "git+https://github.com/rvolosatovs/wasm-tools?branch=feat%2Fstream-forward-0.254#1498f6c61ba2efe316dd996c896c66e4ebb7f04d"
 dependencies = [
  "leb128fmt",
  "wasmparser 0.254.0",
@@ -4438,6 +4441,7 @@ dependencies = [
 [[package]]
 name = "wasm-metadata"
 version = "0.254.0"
+source = "git+https://github.com/rvolosatovs/wasm-tools?branch=feat%2Fstream-forward-0.254#1498f6c61ba2efe316dd996c896c66e4ebb7f04d"
 dependencies = [
  "anyhow",
  "indexmap 2.14.0",
@@ -4448,6 +4452,7 @@ dependencies = [
 [[package]]
 name = "wasm-mutate"
 version = "0.254.0"
+source = "git+https://github.com/rvolosatovs/wasm-tools?branch=feat%2Fstream-forward-0.254#1498f6c61ba2efe316dd996c896c66e4ebb7f04d"
 dependencies = [
  "egg",
  "log",
@@ -4460,6 +4465,7 @@ dependencies = [
 [[package]]
 name = "wasm-smith"
 version = "0.254.0"
+source = "git+https://github.com/rvolosatovs/wasm-tools?branch=feat%2Fstream-forward-0.254#1498f6c61ba2efe316dd996c896c66e4ebb7f04d"
 dependencies = [
  "anyhow",
  "arbitrary",
@@ -4481,6 +4487,7 @@ dependencies = [
 [[package]]
 name = "wasm-wave"
 version = "0.254.0"
+source = "git+https://github.com/rvolosatovs/wasm-tools?branch=feat%2Fstream-forward-0.254#1498f6c61ba2efe316dd996c896c66e4ebb7f04d"
 dependencies = [
  "anyhow",
  "logos",
@@ -4553,6 +4560,7 @@ dependencies = [
 [[package]]
 name = "wasmparser"
 version = "0.254.0"
+source = "git+https://github.com/rvolosatovs/wasm-tools?branch=feat%2Fstream-forward-0.254#1498f6c61ba2efe316dd996c896c66e4ebb7f04d"
 dependencies = [
  "bitflags 2.11.1",
  "hashbrown 0.17.0",
@@ -4564,6 +4572,7 @@ dependencies = [
 [[package]]
 name = "wasmprinter"
 version = "0.254.0"
+source = "git+https://github.com/rvolosatovs/wasm-tools?branch=feat%2Fstream-forward-0.254#1498f6c61ba2efe316dd996c896c66e4ebb7f04d"
 dependencies = [
  "anyhow",
  "termcolor",
@@ -5316,6 +5325,7 @@ dependencies = [
 [[package]]
 name = "wast"
 version = "254.0.0"
+source = "git+https://github.com/rvolosatovs/wasm-tools?branch=feat%2Fstream-forward-0.254#1498f6c61ba2efe316dd996c896c66e4ebb7f04d"
 dependencies = [
  "bumpalo",
  "gimli 0.32.3",
@@ -5328,6 +5338,7 @@ dependencies = [
 [[package]]
 name = "wat"
 version = "1.254.0"
+source = "git+https://github.com/rvolosatovs/wasm-tools?branch=feat%2Fstream-forward-0.254#1498f6c61ba2efe316dd996c896c66e4ebb7f04d"
 dependencies = [
  "wast 254.0.0",
 ]
@@ -5763,6 +5774,7 @@ dependencies = [
 [[package]]
 name = "wit-component"
 version = "0.254.0"
+source = "git+https://github.com/rvolosatovs/wasm-tools?branch=feat%2Fstream-forward-0.254#1498f6c61ba2efe316dd996c896c66e4ebb7f04d"
 dependencies = [
  "anyhow",
  "bitflags 2.11.1",
@@ -5798,6 +5810,7 @@ dependencies = [
 [[package]]
 name = "wit-parser"
 version = "0.254.0"
+source = "git+https://github.com/rvolosatovs/wasm-tools?branch=feat%2Fstream-forward-0.254#1498f6c61ba2efe316dd996c896c66e4ebb7f04d"
 dependencies = [
  "anyhow",
  "hashbrown 0.17.0",
