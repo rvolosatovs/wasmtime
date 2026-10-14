@@ -502,6 +502,10 @@ where
                                   futures: &mut FuturesUnordered<_>,
                                   start_times: &mut StartTimes,
                                   reuse_count: &mut usize| {
+                // Caller dropped while this request was still queued.
+                if abandoned.flag.load(Relaxed) {
+                    return;
+                }
                 // Set `accept_concurrent` to false, conservatively assuming
                 // that the new task will be CPU-bound, at least to begin with.
                 // Only once the `StoreContextMut::run_concurrent` event loop
