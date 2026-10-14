@@ -496,6 +496,7 @@ where
             let mut futures = FuturesUnordered::new();
             let mut start_times = StartTimes::default();
 
+            #[cfg(feature = "p2")]
             let accepted = accepted.clone();
             let accept_request = |(request_data, request, tx, abandoned): WorkerRequest<S>,
                                   futures: &mut FuturesUnordered<_>,
