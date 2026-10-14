@@ -12,6 +12,7 @@ use futures::{
     channel::oneshot,
     future::{Either, FutureExt},
     stream::{FuturesUnordered, Stream},
+    task::AtomicWaker,
 };
 #[cfg(feature = "p3")]
 use p3::bindings::http::types as p3_types;
@@ -319,6 +320,11 @@ impl StartTimes {
     }
 }
 
+struct Abandon {
+    flag: AtomicBool,
+    waker: AtomicWaker,
+}
+
 /// A request queued for a worker.
 ///
 /// The last element is set when the caller drops the `handle` future for this
@@ -331,7 +337,7 @@ type WorkerRequest<S> = (
     <<S as HandlerState>::WorkerState as WorkerState>::RequestData,
     Request,
     oneshot::Sender<Result<Response, wasmtime::Error>>,
-    Arc<AtomicBool>,
+    Arc<Abandon>,
 );
 
 struct Worker<S>
@@ -480,8 +486,8 @@ where
 
         let accept_concurrent = AtomicBool::new(true);
         let status = Mutex::new((WorkerStatus::Idle, Instant::now()));
-        // Abandonment flags of the requests this worker has accepted.
-        let accepted: Arc<Mutex<Vec<Arc<AtomicBool>>>> = Arc::new(Mutex::new(Vec::new()));
+        // p2 slots only. p3 cancellation stays inside `Prepared::run`.
+        let accepted: Arc<Mutex<Vec<Arc<Abandon>>>> = Arc::new(Mutex::new(Vec::new()));
         let mut expiration = pin!(expiration);
 
         let function = async |accessor: &Accessor<_>| {
@@ -506,7 +512,13 @@ where
                 // additional requests for other workers to handle.
                 accept_concurrent.store(false, Relaxed);
                 *reuse_count += 1;
-                accepted.lock().unwrap().push(abandoned);
+                // A p3 worker may have other requests in flight; don't record them here.
+                #[cfg(feature = "p2")]
+                if matches!(proxy, Proxy::P2(_)) {
+                    accepted.lock().unwrap().push(abandoned);
+                }
+                #[cfg(not(feature = "p2"))]
+                drop(abandoned);
 
                 let prepared = accessor.with(|mut store| {
                     let prepared = Prepared::new(store.as_context_mut(), proxy, request, view, tx);
@@ -730,16 +742,19 @@ where
 
                     let (status, start) = *status.try_lock().unwrap();
 
-                    // If any request this worker accepted has been abandoned by
-                    // its caller then there is nobody left to receive the
-                    // response, so wind the worker down rather than waiting for
-                    // the full request timeout.
-                    //
-                    // This is the p2 counterpart of the `poll_canceled`
-                    // handling in `Prepared::run`: it has to be observed here,
-                    // because a synchronous guest can block the
-                    // `run_concurrent` event loop where that future lives.
-                    if accepted.lock().unwrap().iter().any(|f| f.load(Relaxed)) {
+                    // p2 only. Register first, then load, so a drop during this
+                    // poll still wakes the task.
+                    let mut abandoned_p2 = false;
+                    {
+                        let accepted = accepted.lock().unwrap();
+                        for slot in accepted.iter() {
+                            slot.waker.register(cx.waker());
+                            if slot.flag.load(Relaxed) {
+                                abandoned_p2 = true;
+                            }
+                        }
+                    }
+                    if abandoned_p2 {
                         return Poll::Ready(Err(ExpirationError.into()));
                     }
 
@@ -918,12 +933,15 @@ where
         data: <S::WorkerState as WorkerState>::RequestData,
         request: Request,
     ) -> Result<Response, wasmtime::Error> {
-        let abandoned = Arc::new(AtomicBool::new(false));
+        let abandoned = Arc::new(Abandon {
+            flag: AtomicBool::new(false),
+            waker: AtomicWaker::new(),
+        });
         /// Marks the request as abandoned **only if** the future is dropped
         /// before the request completes; [`disarm`](AbandonGuard::disarm) is
         /// called once a response has been received.
         struct AbandonGuard {
-            flag: Arc<AtomicBool>,
+            slot: Arc<Abandon>,
             armed: bool,
         }
         impl AbandonGuard {
@@ -934,12 +952,13 @@ where
         impl Drop for AbandonGuard {
             fn drop(&mut self) {
                 if self.armed {
-                    self.flag.store(true, Relaxed);
+                    self.slot.flag.store(true, Relaxed);
+                    self.slot.waker.wake();
                 }
             }
         }
         let mut abandon = AbandonGuard {
-            flag: abandoned.clone(),
+            slot: abandoned.clone(),
             armed: true,
         };
 
