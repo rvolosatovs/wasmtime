@@ -9,9 +9,9 @@ macro_rules! assert_test_exists {
 
 mod http_server;
 mod p2;
-mod pr14625;
 #[cfg(feature = "p3")]
 mod p3;
+mod pr14625;
 mod shared;
 
 mod body {
