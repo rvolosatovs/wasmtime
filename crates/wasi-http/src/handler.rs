@@ -1187,17 +1187,16 @@ impl<'a, T: Send> Prepared<'a, T> {
                 // response is no longer of interest to anyone.  (This is
                 // `oneshot::Sender::poll_canceled`; the TODO above calls it
                 // `poll_close`, which is tokio's name for the same idea.)
-                let closed = std::future::poll_fn(|cx| tx.poll_canceled(cx));
-                futures::pin_mut!(closed);
+                let closed = pin!(future::poll_fn(|cx| tx.poll_canceled(cx)));
 
                 let (result, sent) = match futures::future::select(
-                    futures::future::select(handle, expiration),
-                    closed,
+                    handle,
+                    futures::future::select(closed, expiration),
                 )
                 .await
                 {
-                    Either::Left((Either::Left((result, _)), _)) => (result, true),
-                    Either::Left((Either::Right(((), _)), _)) => {
+                    Either::Left((result, ..)) => (result, true),
+                    Either::Right(_) => {
                         // TODO: We should also send a cancel request to the expired
                         // task to give it a chance to shut down gracefully, but as of
                         // this writing Wasmtime does not yet provide an API for doing
@@ -1206,7 +1205,6 @@ impl<'a, T: Send> Prepared<'a, T> {
                         // (which we'll ignore) or the instance itself has expired.
                         (Err(ExpirationError.into()), false)
                     }
-                    Either::Right(((), _)) => (Err(ExpirationError.into()), false),
                 };
 
                 _ = tx.send(result);
