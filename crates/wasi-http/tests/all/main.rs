@@ -7,6 +7,8 @@ macro_rules! assert_test_exists {
     };
 }
 
+#[cfg(feature = "component-model-async")]
+mod handler;
 mod http_server;
 mod p2;
 #[cfg(feature = "p3")]
