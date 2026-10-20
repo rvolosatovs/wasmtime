@@ -477,6 +477,8 @@ where
 
         let accept_concurrent = AtomicBool::new(true);
         let status = Mutex::new((WorkerStatus::Idle, Instant::now()));
+        #[cfg(feature = "p2")]
+        let p2_tx = Mutex::new(None);
         let mut expiration = pin!(expiration);
 
         let function = async |accessor: &Accessor<_>| {
@@ -489,6 +491,10 @@ where
                                   futures: &mut FuturesUnordered<_>,
                                   start_times: &mut StartTimes,
                                   reuse_count: &mut usize| {
+                if tx.is_canceled() {
+                    return;
+                }
+
                 // Set `accept_concurrent` to false, conservatively assuming
                 // that the new task will be CPU-bound, at least to begin with.
                 // Only once the `StoreContextMut::run_concurrent` event loop
@@ -522,6 +528,11 @@ where
                         Err(e) => Err(e),
                     }
                 });
+
+                #[cfg(feature = "p2")]
+                if let Ok((Prepared::P2 { tx, .. }, _)) = &prepared {
+                    *p2_tx.lock().unwrap() = Some(tx.clone());
+                }
 
                 let start_time = Instant::now();
                 start_times.add(start_time);
@@ -722,6 +733,14 @@ where
                     // recently recorded state of the worker.
 
                     let (status, start) = *status.try_lock().unwrap();
+
+                    #[cfg(feature = "p2")]
+                    if let Some(tx) = &*p2_tx.lock().unwrap()
+                        && let Some(tx) = &mut *tx.lock().unwrap()
+                        && tx.poll_canceled(cx).is_ready()
+                    {
+                        return Poll::Ready(Ok(()));
+                    }
 
                     if let Poll::Ready(()) = expiration.as_mut().poll(cx, status, start) {
                         return Poll::Ready(match status {
